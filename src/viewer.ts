@@ -583,7 +583,7 @@ export class Viewer extends RefCounted implements ViewerState {
 
     this.dataSourceProvider = dataSourceProvider;
     this.uiConfiguration = uiConfiguration;
-    
+
     // Create effective showLayerPanel state that combines configuration and user preference
     this.effectiveShowLayerPanel = this.registerDisposer(
       makeDerivedWatchableValue(
@@ -593,9 +593,8 @@ export class Viewer extends RefCounted implements ViewerState {
         },
         this.uiConfiguration.showLayerPanel,
         this.hideLayerPanelState,
-      )
+      ),
     );
-    
 
     this.registerDisposer(
       observeWatchable((value) => {
