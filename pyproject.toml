@@ -19,6 +19,7 @@ dependencies = [
   "numpy>=1.11.0",
   "pillow>=3.2.0",
   "requests>=2.32.3",
+  "scipy>=1.17.1",
   "tornado>=6.4.2",
 ]
 
