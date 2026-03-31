@@ -361,7 +361,6 @@ class LinearRegistrationWorkflow:
         # currently unused, keeping to parallel the above map
         self.stored_map_moving_name_to_viewer_coords = {}
         self.affine = None
-        self._prev_affine = None
         self.viewer = neuroglancer.Viewer()
         self.viewer.shared_state.add_changed_callback(
             lambda: self.viewer.defer_callback(self.update)
@@ -509,11 +508,24 @@ class LinearRegistrationWorkflow:
             # space for such layers, so falling back to s.dimensions is equivalent.
             print(
                 f"volume_info failed for {self.moving_name} ({e}); "
-                "falling back to global viewer dimensions"
+                "falling back to fixed spatial dimensions"
             )
             with self.viewer.txn() as s:
+                fixed_dims, _ = self.get_fixed_and_moving_dims(s)
+                all_dims = s.dimensions
+                indices = [
+                    i for i, n in enumerate(all_dims.names) if n in fixed_dims
+                ]
+                if indices:
+                    data_coords = neuroglancer.CoordinateSpace(
+                        names=[all_dims.names[i] for i in indices],
+                        units=[all_dims.units[i] for i in indices],
+                        scales=np.array([all_dims.scales[i] for i in indices]),
+                    )
+                else:
+                    data_coords = all_dims
                 self.stored_map_moving_name_to_data_coords[self.moving_name] = (
-                    s.dimensions
+                    data_coords
                 )
         else:
             self.stored_map_moving_name_to_data_coords[self.moving_name] = (
@@ -546,29 +558,24 @@ class LinearRegistrationWorkflow:
                 for source in s.layers[layer_name].source:
                     if source.transform is None:
                         output_dims_final = copy_coord_space(output_dims, "2")
-                        # Add channel dims (c^, c', c#) from channelDimensions if present,
-                        # since plain URL sources don't have a Python-visible transform to
-                        # read them from. copy_coord_space preserves channel dim names as-is.
-                        channel_dims_json = s.layers[layer_name].to_json().get(
-                            "channelDimensions", {}
-                        )
-                        if channel_dims_json:
-                            chan_space = neuroglancer.CoordinateSpace(
-                                json=channel_dims_json
-                            )
-                            output_dims_final = neuroglancer.CoordinateSpace(
-                                names=list(output_dims_final.names)
-                                + list(chan_space.names),
-                                units=list(output_dims_final.units)
-                                + list(chan_space.units),
-                                scales=np.concatenate(
-                                    [output_dims_final.scales, chan_space.scales]
-                                ),
-                            )
                     else:
-                        output_dims_final = copy_coord_space(
-                            source.transform.output_dimensions, "2"
+                        # Strip channel dims from the existing transform's output dims
+                        # before priming — channel dims are local to the layer and
+                        # handled by channelDimensions, not the source transform.
+                        existing_out = source.transform.output_dimensions
+                        spatial_names = [
+                            n for n in existing_out.names
+                            if not n.endswith(("'", "^", "#"))
+                        ]
+                        spatial_indices = [
+                            list(existing_out.names).index(n) for n in spatial_names
+                        ]
+                        spatial_space = neuroglancer.CoordinateSpace(
+                            names=spatial_names,
+                            units=[existing_out.units[i] for i in spatial_indices],
+                            scales=np.array([existing_out.scales[i] for i in spatial_indices]),
                         )
+                        output_dims_final = copy_coord_space(spatial_space, "2")
                     new_coord_space = neuroglancer.CoordinateSpaceTransform(
                         output_dimensions=output_dims_final,
                     )
@@ -768,49 +775,6 @@ class LinearRegistrationWorkflow:
                 full_matrix[i, -1] = affine[moving_i, -1]
         return full_matrix
 
-    def combine_local_channels_with_transform(
-        self, existing_transform: neuroglancer.CoordinateSpaceTransform, transform: list
-    ):
-        """The affine transform estimation does not account for local channel dimensions.
-        But neuroglancer requires these dimensions to be included in the layer transform.
-        This function inserts essentially padding in the correct locations in the matrix
-        for local channels.
-        """
-        out_names = existing_transform.outputDimensions.names
-        local_channel_names = [
-            name for name in out_names if name.endswith(("'", "^", "#"))
-        ]
-        if not local_channel_names:
-            return transform
-        # Build a matrix whose rows follow the order of out_names.
-        # Input column layout: [spatial_0, ..., spatial_{n-1}, chan_0, ..., chan_{m-1}, 1]
-        # where n = len(transform) (spatial dims) and m = len(local_channel_names).
-        # Channel columns are always at position n_spatial + chan_idx regardless of
-        # where the channel dims appear in the output ordering.
-        n_spatial = len(transform)
-        n_channel = len(local_channel_names)
-        n_cols = n_spatial + n_channel + 1  # spatial + channel + translation
-        result = []
-        spatial_count = 0
-        for name in out_names:
-            if name.endswith(("'", "^", "#")):
-                # Channel output dim: identity passthrough at its input column.
-                chan_idx = local_channel_names.index(name)
-                row = [0.0] * n_cols
-                row[n_spatial + chan_idx] = 1.0
-                result.append(row)
-            else:
-                # Spatial output dim: affine row with zeros for channel input cols.
-                spatial_row = transform[spatial_count]
-                row = (
-                    list(spatial_row[:n_spatial])
-                    + [0.0] * n_channel
-                    + [spatial_row[n_spatial]]
-                )
-                result.append(row)
-                spatial_count += 1
-        return result
-
     def has_two_coord_spaces(self, s: neuroglancer.ViewerState):
         """Check if the two coord space setup is complete"""
         fixed_dims, moving_dims = self.get_fixed_and_moving_dims(s)
@@ -884,62 +848,6 @@ class LinearRegistrationWorkflow:
             )
         return np.array(fixed_points), np.array(moving_points), current_position
 
-    def _build_transform_dims_with_channels(self, v, existing_transform):
-        """Return (input dims, primed output dims) for a source with channel dims.
-
-        ``existing_transform.output_dimensions`` is the already-primed output
-        set by ``_create_second_coord_space`` (e.g. ``(c^, x2, y2, z2)`` or
-        ``(x2, y2, z2, c^)`` depending on the source's original convention).
-        We use it directly as ``output_dims_primed`` so the row order produced
-        by ``combine_local_channels_with_transform`` stays consistent with the
-        output dim ordering.
-
-        ``input_dims`` = spatial dims from ``v`` + channel dims appended at the
-        end (they are synthetic / source_rank-excluded per neuroglancer semantics).
-        """
-        out = existing_transform.output_dimensions
-        chan_names = [n for n in out.names if n.endswith(("'", "^", "#"))]
-        if not chan_names:
-            return v, copy_coord_space(v, "2")
-        chan_indices = [list(out.names).index(n) for n in chan_names]
-        chan_units = [out.units[i] for i in chan_indices]
-        chan_scales = [out.scales[i] for i in chan_indices]
-        # Input: spatial dims first, channel dims appended at the end.
-        input_dims = neuroglancer.CoordinateSpace(
-            names=list(v.names) + chan_names,
-            units=list(v.units) + chan_units,
-            scales=np.concatenate([v.scales, chan_scales]),
-        )
-        # Output: use the existing primed output directly to preserve dim ordering.
-        return input_dims, out
-
-    def _correct_position_for_transform_change(
-        self, s: neuroglancer.ViewerState, prev_affine, new_affine
-    ):
-        """Update primed-space position so the same image content stays in view."""
-        _, moving_dims = self.get_fixed_and_moving_dims(s)
-        if not moving_dims:
-            return
-        dim_names = list(s.dimensions.names)
-        try:
-            primed_indices = [dim_names.index(d) for d in moving_dims]
-        except ValueError:
-            return
-        A_old = np.array(prev_affine)[:, :-1]
-        t_old = np.array(prev_affine)[:, -1]
-        A_new = np.array(new_affine)[:, :-1]
-        t_new = np.array(new_affine)[:, -1]
-        old_primed_pos = np.array(s.position)[primed_indices]
-        try:
-            data_pos = np.linalg.inv(A_old) @ (old_primed_pos - t_old)
-        except np.linalg.LinAlgError:
-            return
-        new_primed_pos = A_new @ data_pos + t_new
-        pos = list(s.position)
-        for i, idx in enumerate(primed_indices):
-            pos[idx] = float(new_primed_pos[i])
-        s.position = pos
-
     def update_registered_layers(self, s: neuroglancer.ViewerState):
         """When the affine updates, update the relevant transform in all layers
         which depend upon the affine.
@@ -952,65 +860,33 @@ class LinearRegistrationWorkflow:
             transform = self.affine.tolist()
             for k, v in self.stored_map_moving_name_to_data_coords.items():
                 for i, source in enumerate(s.layers[k].source):
-                    # _create_second_coord_space sets source.transform with primed spatial
-                    # dims plus any channel dims read from channelDimensions (e.g. c^).
-                    # Use source.transform as the reference when it has channel dims;
-                    # fall back to registered_source.transform (if JS has populated it)
-                    # for layers where channelDimensions was absent at setup time.
                     registered_source = s.layers[k + "_registered"].source[i]
-                    moving_has_channels = any(
-                        n.endswith(("'", "^", "#"))
-                        for n in source.transform.output_dimensions.names
+                    # Channel dims (c^, c', c#) are local to the layer and handled
+                    # by channelDimensions; strip them from the source transform's
+                    # output dims so only the spatial primed dims remain.
+                    ref_out = source.transform.output_dimensions
+                    spatial_out_names = [
+                        n for n in ref_out.names if not n.endswith(("'", "^", "#"))
+                    ]
+                    spatial_out_indices = [
+                        list(ref_out.names).index(n) for n in spatial_out_names
+                    ]
+                    output_dims_primed = neuroglancer.CoordinateSpace(
+                        names=spatial_out_names,
+                        units=[ref_out.units[i] for i in spatial_out_indices],
+                        scales=np.array([ref_out.scales[i] for i in spatial_out_indices]),
                     )
-                    if not moving_has_channels and registered_source.transform is not None:
-                        ref_transform = registered_source.transform
-                    else:
-                        ref_transform = source.transform
-                    # Matrix for the moving layer: rows follow output_dims_primed order
-                    # (preserves the source's original channel-dim position).
-                    fixed_to_moving_transform_with_locals = (
-                        self.combine_local_channels_with_transform(
-                            ref_transform, transform
-                        )
+                    source.transform = neuroglancer.CoordinateSpaceTransform(
+                        input_dimensions=v,
+                        output_dimensions=output_dims_primed,
+                        matrix=transform,
                     )
-                    input_dims, output_dims_primed = (
-                        self._build_transform_dims_with_channels(v, ref_transform)
-                    )
-                    # Matrix for the registered layer: rows follow input_dims order
-                    # (channels always last so it matches output_dimensions=input_dims).
-                    canonical_ref = neuroglancer.CoordinateSpaceTransform(
-                        output_dimensions=input_dims
-                    )
-                    fixed_to_registered_transform_with_locals = (
-                        self.combine_local_channels_with_transform(
-                            canonical_ref, transform
-                        )
-                    )
-                    # source_rank tells neuroglancer that only the first len(v.names)
-                    # input dims are real source dimensions.  Channel dims (c^, c', c#)
-                    # beyond source_rank are "synthetic" — they embed the source in the
-                    # larger local coordinate space without fetching data along that axis.
-                    spatial_rank = len(v.names)
-                    fixed_dims_to_moving_dims_transform = (
-                        neuroglancer.CoordinateSpaceTransform(
-                            input_dimensions=input_dims,
-                            output_dimensions=output_dims_primed,
-                            matrix=fixed_to_moving_transform_with_locals,
-                            source_rank=spatial_rank,
-                        )
-                    )
-                    source.transform = fixed_dims_to_moving_dims_transform
 
-                    registered_source = s.layers[k + "_registered"].source[i]
-                    fixed_dims_to_fixed_dims_transform = (
-                        neuroglancer.CoordinateSpaceTransform(
-                            input_dimensions=input_dims,
-                            output_dimensions=input_dims,
-                            matrix=fixed_to_registered_transform_with_locals,
-                            source_rank=spatial_rank,
-                        )
+                    registered_source.transform = neuroglancer.CoordinateSpaceTransform(
+                        input_dimensions=v,
+                        output_dimensions=v,
+                        matrix=transform,
                     )
-                    registered_source.transform = fixed_dims_to_fixed_dims_transform
             annotation_transform = neuroglancer.CoordinateSpaceTransform(
                 input_dimensions=create_coord_space_matching_global_dims(s.dimensions),
                 output_dimensions=create_coord_space_matching_global_dims(s.dimensions),
@@ -1018,10 +894,18 @@ class LinearRegistrationWorkflow:
             )
             s.layers[self.annotations_name].source[0].transform = annotation_transform
 
-            if self._prev_affine is not None:
-                self._correct_position_for_transform_change(
-                    s, self._prev_affine, self.affine
-                )
+            if len(self.stored_points[0]) > 0:
+                _, moving_dims = self.get_fixed_and_moving_dims(s)
+                if moving_dims:
+                    last_fixed = np.array(self.stored_points[0][-1])
+                    A = np.array(self.affine)
+                    new_primed = A[:, :-1] @ last_fixed + A[:, -1]
+                    dim_names = list(s.dimensions.names)
+                    pos = list(s.position)
+                    for i, dim in enumerate(moving_dims):
+                        if i < len(new_primed) and dim in dim_names:
+                            pos[dim_names.index(dim)] = float(new_primed[i])
+                    s.position = pos
 
             print(
                 f"Updated affine transform (without channel dimensions): {transform}, written to {self.output_name}"
@@ -1041,7 +925,6 @@ class LinearRegistrationWorkflow:
                 affine = np.zeros(shape=(n_dims, n_dims + 1))
                 for i in range(n_dims):
                     affine[i][i] = 1
-                self._prev_affine = self.affine
                 self.affine = affine
                 self.stored_points = ([], [], False)
                 return True
@@ -1065,7 +948,6 @@ class LinearRegistrationWorkflow:
                 np.isclose(self.stored_points[1], moving_points)
             ):
                 return False
-        self._prev_affine = self.affine
         self.affine = estimate_transform(
             fixed_points, moving_points, self._force_non_affine
         )

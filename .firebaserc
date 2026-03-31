@@ -1,6 +1,7 @@
 {
   "projects": {
-    "default": "neuroglancer-demo"
+    "default": "em-270621",
+    "ngregister": "em-270621"
   },
   "targets": {
     "neuroglancer-demo": {
