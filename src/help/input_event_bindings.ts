@@ -201,6 +201,18 @@ export class InputEventBindingHelpDialog extends SidePanel {
     const { scroll, bindings, toolBinder } = this;
     removeChildren(scroll);
 
+    {
+      const docsLinkContainer = document.createElement("div");
+      docsLinkContainer.classList.add("neuroglancer-docs-link-container");
+      const docsLink = document.createElement("a");
+      docsLink.href = "https://neuroglancer-docs.web.app";
+      docsLink.target = "_blank";
+      docsLink.textContent = "Documentation";
+      docsLink.classList.add("neuroglancer-docs-link");
+      docsLinkContainer.appendChild(docsLink);
+      scroll.appendChild(docsLinkContainer);
+    }
+
     if (typeof NEUROGLANCER_BUILD_INFO !== "undefined") {
       const header = document.createElement("h2");
       header.textContent = "Build info";

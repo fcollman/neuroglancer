@@ -55,6 +55,21 @@
   margin-left: 4ex;
 }
 
+.neuroglancer-docs-link-container {
+  padding: 6px 4px;
+}
+
+.neuroglancer-docs-link {
+  color: #4fc3f7;
+  text-decoration: none;
+  font-size: 10pt;
+  font-family: sans-serif;
+}
+
+.neuroglancer-docs-link:hover {
+  text-decoration: underline;
+}
+
 .neuroglancer-build-info {
   font-size: 10pt;
   user-select: text;
