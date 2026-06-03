@@ -42,6 +42,7 @@ import {
   VolumeChunkEncoding,
   VolumeChunkSourceParameters,
 } from "#src/datasource/precomputed/base.js";
+import { parseMapBuffer } from "#src/datasource/precomputed/mapbuffer.js";
 import type {
   ShardedKvStore,
   ShardInfo,
@@ -67,8 +68,6 @@ import {
   MeshSource,
   MultiscaleMeshSource,
 } from "#src/mesh/backend.js";
-import { parseMapBuffer } from "#src/datasource/precomputed/mapbuffer.js";
-import { decodeBrotli } from "#src/util/brotli.js";
 import { decodeDracoPartitioned } from "#src/mesh/draco/index.js";
 import type {
   SkeletonChunk,
@@ -88,6 +87,7 @@ import { decodePngChunk } from "#src/sliceview/backend_chunk_decoders/png.js";
 import { decodeRawChunk } from "#src/sliceview/backend_chunk_decoders/raw.js";
 import type { VolumeChunk } from "#src/sliceview/volume/backend.js";
 import { VolumeChunkSource } from "#src/sliceview/volume/backend.js";
+import { decodeBrotli } from "#src/util/brotli.js";
 import { convertEndian32, Endianness } from "#src/util/endian.js";
 import { vec3 } from "#src/util/geom.js";
 import { maybeDecompressGzip } from "#src/util/gzip.js";
