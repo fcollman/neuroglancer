@@ -425,7 +425,7 @@ describe("layer/segmentation spatial skeleton selection serialization", () => {
       active: true,
       position: new Float32Array(0),
       pickedRenderLayer: renderLayer,
-      pickedSpatialSkeleton: { nodeId: 31, segmentId: 9 },
+      pickedSpatialSkeleton: { nodeId: 31, segmentId: 9n },
     } as any);
 
     expect(state.nodeId).toBe("31");
@@ -459,7 +459,7 @@ describe("layer/segmentation spatial skeleton selection serialization", () => {
       active: true,
       position: new Float32Array(0),
       pickedRenderLayer: otherRenderLayer,
-      pickedSpatialSkeleton: { nodeId: 31, segmentId: 9 },
+      pickedSpatialSkeleton: { nodeId: 31, segmentId: 9n },
     } as any);
 
     expect(state.nodeId).toBeUndefined();

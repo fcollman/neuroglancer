@@ -15,11 +15,13 @@
  */
 
 import type { SpatialSkeletonSourceState } from "#src/skeleton/api.js";
-import type { TypedNumberArray } from "#src/util/array.js";
+import type { TypedArray } from "#src/util/array.js";
 
 export interface SkeletonChunkData {
   vertexPositions: Float32Array | null;
-  vertexAttributes: TypedNumberArray[] | null;
+  // The `segment` attribute is a BigUint64Array (uint64); other attributes are
+  // numeric typed arrays. Serialization only touches buffer/byteOffset/byteLength.
+  vertexAttributes: TypedArray[] | null;
   indices: Uint32Array | null;
   lod?: number;
   nodeIds?: Int32Array;

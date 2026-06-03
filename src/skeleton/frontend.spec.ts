@@ -44,11 +44,11 @@ describe("resolveSpatiallyIndexedSkeletonSegmentPick", () => {
       indices: new Uint32Array([0, 1, 1, 2]),
       numVertices: 3,
     };
-    const segmentIds = new Uint32Array([11, 13, 17]);
+    const segmentIds = new BigUint64Array([11n, 13n, 17n]);
 
     expect(
       resolveSpatiallyIndexedSkeletonSegmentPick(chunk, segmentIds, 1, "node"),
-    ).toBe(13);
+    ).toBe(13n);
   });
 
   it("returns the first valid endpoint segment id for direct edge picks", () => {
@@ -56,14 +56,14 @@ describe("resolveSpatiallyIndexedSkeletonSegmentPick", () => {
       indices: new Uint32Array([0, 1, 1, 2]),
       numVertices: 3,
     };
-    const segmentIds = new Uint32Array([0, 19, 23]);
+    const segmentIds = new BigUint64Array([0n, 19n, 23n]);
 
     expect(
       resolveSpatiallyIndexedSkeletonSegmentPick(chunk, segmentIds, 0, "edge"),
-    ).toBe(19);
+    ).toBe(19n);
     expect(
       resolveSpatiallyIndexedSkeletonSegmentPick(chunk, segmentIds, 1, "edge"),
-    ).toBe(19);
+    ).toBe(19n);
   });
 
   it("returns undefined for out-of-range direct picks", () => {
@@ -71,7 +71,7 @@ describe("resolveSpatiallyIndexedSkeletonSegmentPick", () => {
       indices: new Uint32Array([0, 1]),
       numVertices: 2,
     };
-    const segmentIds = new Uint32Array([5, 7]);
+    const segmentIds = new BigUint64Array([5n, 7n]);
 
     expect(
       resolveSpatiallyIndexedSkeletonSegmentPick(chunk, segmentIds, 4, "node"),
@@ -85,7 +85,7 @@ describe("resolveSpatiallyIndexedSkeletonSegmentPick", () => {
 describe("SpatiallyIndexedSkeletonLayer browse node picks", () => {
   it("resolves browse node picks with node id and source state", () => {
     const positions = new Float32Array([1, 2, 3, 4, 5, 6]);
-    const segmentIds = new Uint32Array([11, 17]);
+    const segmentIds = new BigUint64Array([11n, 17n]);
     const vertexBytes = new Uint8Array(
       positions.byteLength + segmentIds.byteLength,
     );
@@ -106,7 +106,7 @@ describe("SpatiallyIndexedSkeletonLayer browse node picks", () => {
 
     expect((layer as any).resolveNodePickFromChunk(chunk, 1)).toEqual({
       nodeId: 202,
-      segmentId: 17,
+      segmentId: 17n,
       position: new Float32Array([4, 5, 6]),
       sourceState: { revisionToken: "2026-03-29T11:51:00Z" },
     });

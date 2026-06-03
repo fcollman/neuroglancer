@@ -49,7 +49,7 @@ describe("datasource/catmaid/skeleton_packing", () => {
     expect(packed.vertexPositions).toEqual(
       Float32Array.of(1, 2, 3, 4, 5, 6, 7, 8, 9),
     );
-    expect(packed.segmentIds).toEqual(Uint32Array.of(10, 10, 11));
+    expect(packed.segmentIds).toEqual(BigUint64Array.of(10n, 10n, 11n));
     expect(packed.indices).toEqual(Uint32Array.of(1, 0));
     expect(packed.nodeIds).toEqual(Int32Array.of(1, 2, 3));
     expect(packed.sourceStates).toEqual([
@@ -72,6 +72,6 @@ describe("datasource/catmaid/skeleton_packing", () => {
 
     const packed = packCatmaidSkeletonNodes(nodes);
 
-    expect(packed.segmentIds).toEqual(Uint32Array.of(largeSegmentId));
+    expect(packed.segmentIds).toEqual(BigUint64Array.of(BigInt(largeSegmentId)));
   });
 });

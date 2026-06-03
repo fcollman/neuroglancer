@@ -1127,7 +1127,10 @@ export class LayerManager extends RefCounted {
 
 export interface PickedSpatialSkeletonState {
   nodeId?: number;
-  segmentId?: number;
+  // Full uint64 segment id (spatially-indexed skeleton segment attribute is
+  // UINT64). Consumers that need a CATMAID-style 32-bit id convert at their
+  // boundary via Number().
+  segmentId?: bigint;
   position?: Float32Array;
   sourceState?: SpatialSkeletonSourceState;
 }

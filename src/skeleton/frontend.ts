@@ -247,8 +247,8 @@ interface SkeletonGPUGeometry {
   numVertices: number;
   pickNodeIds?: Int32Array;
   pickNodePositions?: Float32Array;
-  pickSegmentIds?: Uint32Array;
-  pickEdgeSegmentIds?: Uint32Array;
+  pickSegmentIds?: BigUint64Array;
+  pickEdgeSegmentIds?: BigUint64Array;
 }
 
 interface PackedSkeletonGeometry {
@@ -265,11 +265,11 @@ type SpatiallyIndexedSkeletonPickData =
       kind: "node";
       nodeIds: Int32Array;
       nodePositions: Float32Array;
-      segmentIds: Uint32Array;
+      segmentIds: BigUint64Array;
     }
   | {
       kind: "edge";
-      segmentIds: Uint32Array;
+      segmentIds: BigUint64Array;
     }
   | {
       kind: "segment-node";
@@ -341,12 +341,11 @@ void spatialChunkCull() {
     }
   }
 
-  // TODO (SKM): segmentAttribute is UINT32 but segments can be UINT64.
-  // Change segmentAttribute.dataType to DataType.UINT64, update vSegmentValue
-  // from `highp uint` (flat) to `highp uvec2` (flat), update
-  // getSegmentAppearanceId to take uvec2 directly, and getSegmentAppearance
-  // signature accordingly. Also pull segmentAttribute and selectedNodeAttribute
-  // out of vertexAttributes entirely (they are internal, not user-defined).
+  // segmentAttribute is UINT64 (read as a `uint64_t`, carried through the
+  // shader as `vSegmentValue` (uvec2, flat) and reconstituted via
+  // `getSegmentAppearanceId`). Backends pack it as a BigUint64Array.
+  // TODO (SKM): pull segmentAttribute and selectedNodeAttribute out of
+  // vertexAttributes entirely (they are internal, not user-defined).
   private finalizeShaderBuilder(
     builder: ShaderBuilder,
     shaderBuilderState: ShaderControlsBuilderState,
@@ -446,7 +445,7 @@ void spatialChunkCull() {
     if (params.hoverHighlight) {
       builder.addUniform("highp uvec2", "uHoveredSegmentId");
     }
-    builder.addVarying("highp uint", "vSegmentValue", "flat");
+    builder.addVarying("highp uvec2", "vSegmentValue", "flat");
 
     const statedColorFragment = params.hasSegmentStatedColors
       ? `
@@ -470,8 +469,8 @@ void spatialChunkCull() {
       : "";
 
     builder.addFragmentCode(`
-uint64_t getSegmentAppearanceId(highp uint segmentValue) {
-  return uint64_t(uvec2(segmentValue, 0u));
+uint64_t getSegmentAppearanceId(highp uvec2 segmentValue) {
+  return uint64_t(segmentValue);
 }
 vec3 getSegmentBaseColor(uint64_t segmentId) {
 ${statedColorFragment}
@@ -490,7 +489,7 @@ float getSegmentLookupAlpha(uint64_t segmentId) {
   bool isVisible = ${this.visibleSegmentsShaderManager.hasFunctionName}(segmentId);
   ${alphaExpression}
 }
-vec4 getSegmentAppearance(highp uint segmentValue) {
+vec4 getSegmentAppearance(highp uvec2 segmentValue) {
   uint64_t segmentId = getSegmentAppearanceId(segmentValue);
   return vec4(getSegmentLookupColor(segmentId), getSegmentLookupAlpha(segmentId));
 }
@@ -669,7 +668,7 @@ highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexInde
             skeletonParams.dynamicSegmentAppearance &&
             this.segmentAttributeIndex !== undefined
           ) {
-            vertexMain += `vSegmentValue = toRaw(readAttribute${this.segmentAttributeIndex}(aVertexIndex.x));\n`;
+            vertexMain += `vSegmentValue = readAttribute${this.segmentAttributeIndex}(aVertexIndex.x).value;\n`;
           }
 
           const segmentColorExpression = this.getSegmentColorExpression();
@@ -793,7 +792,7 @@ highp vec3 vertexPosition = readAttribute0(vertexIndex);
             skeletonParams.dynamicSegmentAppearance &&
             this.segmentAttributeIndex !== undefined
           ) {
-            vertexMain += `vSegmentValue = toRaw(readAttribute${this.segmentAttributeIndex}(vertexIndex));\n`;
+            vertexMain += `vSegmentValue = readAttribute${this.segmentAttributeIndex}(vertexIndex).value;\n`;
           }
           vertexMain += `
 emitCircle(
@@ -1555,11 +1554,11 @@ const vertexPositionAttribute: VertexAttributeRenderInfo = {
 };
 
 const segmentAttribute: VertexAttributeRenderInfo = {
-  dataType: DataType.UINT32,
+  dataType: DataType.UINT64,
   numComponents: 1,
   name: "segment",
   webglDataType: WebGL2RenderingContext.UNSIGNED_INT,
-  glslDataType: getShaderType(DataType.UINT32, 1),
+  glslDataType: getShaderType(DataType.UINT64, 1),
 };
 
 const selectedNodeAttribute: VertexAttributeRenderInfo = {
@@ -1705,7 +1704,7 @@ type SpatiallyIndexedSkeletonChunkListener = (
 
 const spatiallyIndexedSkeletonTextureAttributeSpecs = Object.freeze([
   { name: "position", dataType: DataType.FLOAT32, numComponents: 3 },
-  { name: "segment", dataType: DataType.UINT32, numComponents: 1 },
+  { name: "segment", dataType: DataType.UINT64, numComponents: 1 },
 ]);
 
 export class SpatiallyIndexedSkeletonSource extends SliceViewChunkSource<
@@ -1858,8 +1857,8 @@ class SkeletonOverlayChunk implements SkeletonGPUGeometry {
   readonly numVertices: number;
   readonly pickNodeIds: Int32Array;
   readonly pickNodePositions: Float32Array;
-  readonly pickSegmentIds: Uint32Array;
-  readonly pickEdgeSegmentIds: Uint32Array;
+  readonly pickSegmentIds: BigUint64Array;
+  readonly pickEdgeSegmentIds: BigUint64Array;
   private readonly nodeIdToVertexIndex: Map<number, number>;
   private readonly selectedFormat: TextureFormat;
 
@@ -1998,11 +1997,18 @@ function computeWorldUnitsPerScreenPixel(
 ): number {
   const m = modelViewProjection;
   // Column-major mat4 indices.
-  const m00 = m[0], m10 = m[1];
-  const m01 = m[4], m11 = m[5];
-  const m02 = m[8], m12 = m[9];
-  const m30 = m[3], m31 = m[7], m32 = m[11], m33 = m[15];
-  const w = m30 * worldPoint[0] + m31 * worldPoint[1] + m32 * worldPoint[2] + m33;
+  const m00 = m[0],
+    m10 = m[1];
+  const m01 = m[4],
+    m11 = m[5];
+  const m02 = m[8],
+    m12 = m[9];
+  const m30 = m[3],
+    m31 = m[7],
+    m32 = m[11],
+    m33 = m[15];
+  const w =
+    m30 * worldPoint[0] + m31 * worldPoint[1] + m32 * worldPoint[2] + m33;
   if (!Number.isFinite(w) || w <= 0) return Number.POSITIVE_INFINITY;
   const xScale = Math.sqrt(
     (m00 * viewportWidth) ** 2 + (m10 * viewportHeight) ** 2,
@@ -2220,10 +2226,10 @@ export interface SpatiallyIndexedSkeletonLayerDisplayState
 
 export function resolveSpatiallyIndexedSkeletonSegmentPick(
   chunk: { indices: Uint32Array; numVertices: number },
-  segmentIds: Uint32Array,
+  segmentIds: BigUint64Array,
   pickedOffset: number,
   kind: "node" | "edge",
-) {
+): bigint | undefined {
   if (pickedOffset < 0) return undefined;
   if (kind === "node") {
     if (
@@ -2233,9 +2239,7 @@ export function resolveSpatiallyIndexedSkeletonSegmentPick(
       return undefined;
     }
     const segmentId = segmentIds[pickedOffset];
-    return Number.isSafeInteger(segmentId) && segmentId > 0
-      ? segmentId
-      : undefined;
+    return segmentId > 0n ? segmentId : undefined;
   }
   const indexOffset = pickedOffset * 2;
   if (indexOffset + 1 >= chunk.indices.length) {
@@ -2244,12 +2248,10 @@ export function resolveSpatiallyIndexedSkeletonSegmentPick(
   const vertexA = chunk.indices[indexOffset];
   const vertexB = chunk.indices[indexOffset + 1];
   let segmentId = segmentIds[vertexA];
-  if (!Number.isSafeInteger(segmentId) || segmentId <= 0) {
+  if (segmentId <= 0n) {
     segmentId = segmentIds[vertexB];
   }
-  return Number.isSafeInteger(segmentId) && segmentId > 0
-    ? segmentId
-    : undefined;
+  return segmentId > 0n ? segmentId : undefined;
 }
 
 export class SpatiallyIndexedSkeletonLayer
@@ -2867,10 +2869,15 @@ export class SpatiallyIndexedSkeletonLayer
       chunk.vertexAttributes.byteOffset + offsets[0],
       chunk.numVertices * 3,
     );
-    const segmentIds = new Uint32Array(
-      chunk.vertexAttributes.buffer,
-      chunk.vertexAttributes.byteOffset + offsets[1],
-      chunk.numVertices,
+    // The segment attribute is UINT64 (8 bytes/vertex); its byte offset is a
+    // multiple of 4 but not necessarily 8, so copy into a fresh (8-aligned)
+    // buffer rather than aliasing. Picking is infrequent, so this is cheap.
+    const segStart = chunk.vertexAttributes.byteOffset + offsets[1];
+    const segmentIds = new BigUint64Array(
+      chunk.vertexAttributes.buffer.slice(
+        segStart,
+        segStart + chunk.numVertices * 8,
+      ),
     );
     return { positions, segmentIds };
   }
@@ -3446,11 +3453,8 @@ function transformSpatiallyIndexedSkeletonPickedValue(
   pickState: PickState,
 ): bigint | undefined {
   const pickedSegmentId = pickState.pickedSpatialSkeleton?.segmentId;
-  if (
-    typeof pickedSegmentId === "number" &&
-    Number.isSafeInteger(pickedSegmentId)
-  ) {
-    return BigInt(pickedSegmentId);
+  if (typeof pickedSegmentId === "bigint" && pickedSegmentId > 0n) {
+    return pickedSegmentId;
   }
   return undefined;
 }
@@ -3471,13 +3475,13 @@ function updateSpatiallyIndexedSkeletonMouseState(
       return;
     }
     const segmentId = data.segmentIds[pickedOffset];
-    if (!Number.isSafeInteger(segmentId) || segmentId <= 0) {
+    if (segmentId <= 0n) {
       return;
     }
     mouseState.pickedSpatialSkeleton = { segmentId };
     if (
       !getVisibleSegments(base.displayState.segmentationGroupState.value).has(
-        BigInt(segmentId),
+        segmentId,
       )
     ) {
       return;
@@ -3508,7 +3512,7 @@ function updateSpatiallyIndexedSkeletonMouseState(
       return;
     }
     const segmentId = data.segmentIds[pickedOffset];
-    if (Number.isSafeInteger(segmentId) && segmentId > 0) {
+    if (segmentId > 0n) {
       mouseState.pickedSpatialSkeleton = { segmentId };
     }
     return;

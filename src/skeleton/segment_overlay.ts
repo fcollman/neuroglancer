@@ -25,23 +25,26 @@
 let gpuScratchBuffer = new ArrayBuffer(0);
 let gpuScratchCapacity = 0; // in vertices
 
-// Layout per capacity-slot (cap = gpuScratchCapacity):
-//   [0,       cap*4)  — segmentIds  (Uint32, 4 B/vertex)
-//   [cap*4,   cap*8)  — selected    (Float32, 4 B/vertex)
-//   [cap*8,   cap*16) — edgeIndices (Uint32 pairs, 8 B/vertex max)
-//   [cap*16,  cap*20) — edgeSegIds  (Uint32, 4 B/vertex max)
+// Layout per capacity-slot (cap = gpuScratchCapacity). The segment id is a
+// uint64 (8 B/vertex) to match the skeleton `segment` vertex attribute. The two
+// BigUint64Array views are placed first so their byte offsets stay multiples of
+// 8 (required by BigUint64Array):
+//   [0,       cap*8)  — segmentIds  (BigUint64, 8 B/vertex)
+//   [cap*8,   cap*16) — edgeSegIds  (BigUint64, 8 B/vertex max)
+//   [cap*16,  cap*20) — selected    (Float32, 4 B/vertex)
+//   [cap*20,  cap*28) — edgeIndices (Uint32 pairs, 8 B/vertex max)
 function ensureGpuScratch(numVertices: number) {
   if (numVertices > gpuScratchCapacity) {
     const cap = Math.max(numVertices, gpuScratchCapacity * 2, 64);
-    gpuScratchBuffer = new ArrayBuffer(cap * 20);
+    gpuScratchBuffer = new ArrayBuffer(cap * 28);
     gpuScratchCapacity = cap;
   }
   const cap = gpuScratchCapacity;
   return {
-    segmentIds: new Uint32Array(gpuScratchBuffer, 0, numVertices),
-    selected: new Float32Array(gpuScratchBuffer, cap * 4, numVertices),
-    edgeIndices: new Uint32Array(gpuScratchBuffer, cap * 8, numVertices * 2),
-    edgeSegIds: new Uint32Array(gpuScratchBuffer, cap * 16, numVertices),
+    segmentIds: new BigUint64Array(gpuScratchBuffer, 0, numVertices),
+    edgeSegIds: new BigUint64Array(gpuScratchBuffer, cap * 8, numVertices),
+    selected: new Float32Array(gpuScratchBuffer, cap * 16, numVertices),
+    edgeIndices: new Uint32Array(gpuScratchBuffer, cap * 20, numVertices * 2),
   };
 }
 
@@ -54,11 +57,11 @@ export interface SpatiallyIndexedSkeletonOverlayNodeLike {
 
 export interface SpatiallyIndexedSkeletonOverlayGeometry {
   positions: Float32Array;
-  segmentIds: Uint32Array;
+  segmentIds: BigUint64Array;
   selected: Float32Array;
   nodeIds: Int32Array;
-  pickSegmentIds: Uint32Array;
-  pickEdgeSegmentIds: Uint32Array;
+  pickSegmentIds: BigUint64Array;
+  pickEdgeSegmentIds: BigUint64Array;
   indices: Uint32Array;
   numVertices: number;
 }
@@ -88,7 +91,7 @@ export function buildSpatiallyIndexedSkeletonOverlayGeometry(
   // holds references to them for the lifetime of the chunk.
   const positions = new Float32Array(numVertices * 3);
   const nodeIds = new Int32Array(numVertices);
-  const pickSegmentIds = new Uint32Array(numVertices);
+  const pickSegmentIds = new BigUint64Array(numVertices);
 
   // GPU-upload-only arrays: backed by a reusable scratch buffer. The views are
   // valid until SkeletonOverlayChunk uploads them to the GPU (synchronous), after
@@ -102,7 +105,7 @@ export function buildSpatiallyIndexedSkeletonOverlayGeometry(
     positions[baseOffset] = Number(position[0] ?? 0);
     positions[baseOffset + 1] = Number(position[1] ?? 0);
     positions[baseOffset + 2] = Number(position[2] ?? 0);
-    segmentIds[index] = Math.max(0, Math.round(Number(node.segmentId)));
+    segmentIds[index] = BigInt(Math.max(0, Math.round(Number(node.segmentId))));
     pickSegmentIds[index] = segmentIds[index];
     nodeIds[index] = Math.round(Number(node.nodeId));
     selected[index] =

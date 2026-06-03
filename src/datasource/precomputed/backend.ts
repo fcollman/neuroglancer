@@ -37,6 +37,7 @@ import {
   AnnotationSpatialIndexSourceParameters,
   MeshSourceParameters,
   MultiscaleMeshSourceParameters,
+  PrecomputedSpatialSkeletonSourceParameters,
   SkeletonSourceParameters,
   VolumeChunkEncoding,
   VolumeChunkSourceParameters,
@@ -61,13 +62,20 @@ import {
   computeOctreeChildOffsets,
   decodeJsonManifestChunk,
   decodeTriangleVertexPositionsAndIndices,
+  decodeVertexPositionsAndIndices,
   generateHigherOctreeLevel,
   MeshSource,
   MultiscaleMeshSource,
 } from "#src/mesh/backend.js";
 import { decodeDracoPartitioned } from "#src/mesh/draco/index.js";
-import type { SkeletonChunk } from "#src/skeleton/backend.js";
-import { SkeletonSource } from "#src/skeleton/backend.js";
+import type {
+  SkeletonChunk,
+  SpatiallyIndexedSkeletonChunk,
+} from "#src/skeleton/backend.js";
+import {
+  SkeletonSource,
+  SpatiallyIndexedSkeletonSourceBackend,
+} from "#src/skeleton/backend.js";
 import { decodeSkeletonChunk } from "#src/skeleton/decode_precomputed_skeleton.js";
 import { decodeCompressedSegmentationChunk } from "#src/sliceview/backend_chunk_decoders/compressed_segmentation.js";
 import { decodeCompressoChunk } from "#src/sliceview/backend_chunk_decoders/compresso.js";
@@ -80,6 +88,7 @@ import type { VolumeChunk } from "#src/sliceview/volume/backend.js";
 import { VolumeChunkSource } from "#src/sliceview/volume/backend.js";
 import { convertEndian32, Endianness } from "#src/util/endian.js";
 import { vec3 } from "#src/util/geom.js";
+import { maybeDecompressGzip } from "#src/util/gzip.js";
 import {
   encodeZIndexCompressed,
   encodeZIndexCompressed3d,
@@ -592,6 +601,183 @@ export class PrecomputedSkeletonSource extends WithParameters(
       await response.response.arrayBuffer(),
       parameters.metadata.vertexAttributes,
     );
+  }
+}
+
+// Decodes the vertex positions and edge indices of a single precomputed
+// skeleton fragment (ignores vertex attributes such as radius for the spatial
+// browse view).
+// Returns an ArrayBuffer that starts exactly at the array's data (the fragment
+// decoders index from offset 0).
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  if (bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength) {
+    return bytes.buffer as ArrayBuffer;
+  }
+  return bytes.slice().buffer as ArrayBuffer;
+}
+
+function decodeSpatialSkeletonFragment(buffer: ArrayBuffer) {
+  const dv = new DataView(buffer);
+  const numVertices = dv.getUint32(0, true);
+  const numEdges = dv.getUint32(4, true);
+  const { vertexPositions, indices } = decodeVertexPositionsAndIndices(
+    /*verticesPerPrimitive=*/ 2,
+    buffer,
+    Endianness.LITTLE,
+    /*vertexByteOffset=*/ 8,
+    numVertices,
+    /*indexByteOffset=*/ 8 + numVertices * 4 * 3,
+    numEdges,
+  );
+  return {
+    numVertices,
+    vertexPositions: vertexPositions as Float32Array,
+    indices: indices as Uint32Array,
+  };
+}
+
+// Runs `worker` over `items` with at most `limit` concurrent in flight.
+async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function run() {
+    while (true) {
+      const index = next++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index]);
+    }
+  }
+  const runners: Promise<void>[] = [];
+  for (let i = 0; i < Math.min(limit, items.length); ++i) {
+    runners.push(run());
+  }
+  await Promise.all(runners);
+  return results;
+}
+
+function setEmptySpatialSkeletonChunk(chunk: SpatiallyIndexedSkeletonChunk) {
+  chunk.vertexPositions = new Float32Array(0);
+  chunk.indices = new Uint32Array(0);
+  chunk.vertexAttributes = [new BigUint64Array(0)];
+}
+
+@registerSharedObject()
+export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
+  WithSharedKvStoreContextCounterpart(SpatiallyIndexedSkeletonSourceBackend),
+  PrecomputedSpatialSkeletonSourceParameters,
+) {
+  kvStore = this.sharedKvStoreContext.kvStoreContext.getKvStore(
+    this.parameters.url,
+  );
+  shardedKvStore = getShardedKvStoreIfApplicable(
+    this,
+    this.kvStore,
+    this.parameters.metadata.sharding,
+  );
+
+  async download(chunk: SpatiallyIndexedSkeletonChunk, signal: AbortSignal) {
+    const { metadata, gridOrigin } = this.parameters;
+    const chunkSize = metadata.spatialIndex!.chunkSize;
+    const { chunkGridPosition } = chunk;
+
+    // Absolute (nanometer) bounding box of this chunk; the `.spatial` files are
+    // named by their nm bbox on a grid offset by `gridOrigin`.
+    const lower = new Float64Array(3);
+    for (let i = 0; i < 3; ++i) {
+      lower[i] = gridOrigin[i] + chunkGridPosition[i] * chunkSize[i];
+    }
+    const name =
+      `${lower[0]}-${lower[0] + chunkSize[0]}_` +
+      `${lower[1]}-${lower[1] + chunkSize[1]}_` +
+      `${lower[2]}-${lower[2] + chunkSize[2]}.spatial`;
+
+    const indexResponse = await this.kvStore.store.read(
+      `${this.kvStore.path}${name}`,
+      { signal },
+    );
+    if (indexResponse === undefined) {
+      // No spatial index file for this chunk (outside the dataset, or empty).
+      setEmptySpatialSkeletonChunk(chunk);
+      return;
+    }
+    const indexBytes = await maybeDecompressGzip(
+      await indexResponse.response.arrayBuffer(),
+    );
+    const indexJson = JSON.parse(new TextDecoder().decode(indexBytes));
+    const segmentIds = Object.keys(indexJson).map((k) => BigInt(k));
+    if (segmentIds.length === 0) {
+      setEmptySpatialSkeletonChunk(chunk);
+      return;
+    }
+
+    // Fetch and decode every skeleton fragment listed in the index. For sharded
+    // stores, `readBatch` coalesces what would be one HTTP range request per
+    // segment into a few per-minishard reads.
+    const { shardedKvStore } = this;
+    type Fragment =
+      | (ReturnType<typeof decodeSpatialSkeletonFragment> & { id: bigint })
+      | undefined;
+    let fragments: Fragment[];
+    if (shardedKvStore !== undefined) {
+      const dataMap = await shardedKvStore.readBatch(segmentIds, { signal });
+      fragments = segmentIds.map((id) => {
+        const bytes = dataMap.get(id);
+        if (bytes === undefined) return undefined;
+        return { id, ...decodeSpatialSkeletonFragment(toArrayBuffer(bytes)) };
+      });
+    } else {
+      fragments = await mapWithConcurrency(segmentIds, 16, async (id) => {
+        const response = await fetchByUint64(this, id, signal);
+        if (response === undefined) return undefined;
+        return {
+          id,
+          ...decodeSpatialSkeletonFragment(
+            await response.response.arrayBuffer(),
+          ),
+        };
+      });
+    }
+
+    let totalVertices = 0;
+    let totalIndices = 0;
+    for (const fragment of fragments) {
+      if (fragment === undefined) continue;
+      totalVertices += fragment.numVertices;
+      totalIndices += fragment.indices.length;
+    }
+
+    const vertexPositions = new Float32Array(totalVertices * 3);
+    const segmentIdAttribute = new BigUint64Array(totalVertices);
+    const indices = new Uint32Array(totalIndices);
+    let vertexOffset = 0;
+    let indexOffset = 0;
+    for (const fragment of fragments) {
+      if (fragment === undefined) continue;
+      const { numVertices, vertexPositions: fragPositions } = fragment;
+      // Shift into the gridOrigin-relative nm frame used by the chunk grid.
+      for (let v = 0; v < numVertices; ++v) {
+        const src = v * 3;
+        const dst = (vertexOffset + v) * 3;
+        vertexPositions[dst] = fragPositions[src] - gridOrigin[0];
+        vertexPositions[dst + 1] = fragPositions[src + 1] - gridOrigin[1];
+        vertexPositions[dst + 2] = fragPositions[src + 2] - gridOrigin[2];
+        segmentIdAttribute[vertexOffset + v] = fragment.id;
+      }
+      const { indices: fragIndices } = fragment;
+      for (let e = 0; e < fragIndices.length; ++e) {
+        indices[indexOffset + e] = fragIndices[e] + vertexOffset;
+      }
+      vertexOffset += numVertices;
+      indexOffset += fragIndices.length;
+    }
+
+    chunk.vertexPositions = vertexPositions;
+    chunk.indices = indices;
+    chunk.vertexAttributes = [segmentIdAttribute];
   }
 }
 

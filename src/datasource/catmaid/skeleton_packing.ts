@@ -21,7 +21,9 @@ import type {
 
 interface PackedCatmaidSkeletonData {
   vertexPositions: Float32Array;
-  segmentIds: Uint32Array;
+  // uint64 to match the skeleton `segment` vertex attribute. CATMAID skeleton
+  // ids are safe integers, so widening is lossless.
+  segmentIds: BigUint64Array;
   indices: Uint32Array;
   nodeIds: Int32Array;
   sourceStates: Array<SpatialSkeletonSourceState | undefined>;
@@ -32,7 +34,7 @@ export function packCatmaidSkeletonNodes(
 ): PackedCatmaidSkeletonData {
   const numVertices = nodes.length;
   const vertexPositions = new Float32Array(numVertices * 3);
-  const segmentIds = new Uint32Array(numVertices);
+  const segmentIds = new BigUint64Array(numVertices);
   const nodeIds = new Int32Array(numVertices);
   const sourceStates = new Array<SpatialSkeletonSourceState | undefined>(
     numVertices,
@@ -47,7 +49,7 @@ export function packCatmaidSkeletonNodes(
     vertexPositions[i * 3] = node.position[0];
     vertexPositions[i * 3 + 1] = node.position[1];
     vertexPositions[i * 3 + 2] = node.position[2];
-    segmentIds[i] = node.segmentId;
+    segmentIds[i] = BigInt(Math.max(0, Math.trunc(Number(node.segmentId))));
     sourceStates[i] = node.sourceState;
   }
 

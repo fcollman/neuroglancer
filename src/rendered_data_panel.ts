@@ -529,15 +529,17 @@ export abstract class RenderedDataPanel extends RenderedPanel {
       if (!isSpatialSkeletonSelectableLayer(pickedLayer)) {
         return undefined;
       }
+      // This node-based selection path is reached only for editable
+      // (CATMAID) spatial skeletons, which require a valid integer nodeId
+      // above and use 32-bit segment ids; convert the uint64 pick value to a
+      // number at this boundary.
       const pickedSegmentId = pickedSpatialSkeleton?.segmentId;
       return {
         layer: pickedLayer,
         nodeId: pickedNodeId,
         segmentId:
-          typeof pickedSegmentId === "number" &&
-          Number.isSafeInteger(pickedSegmentId) &&
-          pickedSegmentId > 0
-            ? pickedSegmentId
+          typeof pickedSegmentId === "bigint" && pickedSegmentId > 0n
+            ? Number(pickedSegmentId)
             : undefined,
         position: pickedSpatialSkeleton?.position ?? mouseState.position,
         sourceState: pickedSpatialSkeleton?.sourceState,

@@ -208,8 +208,8 @@ abstract class SpatialSkeletonToolBase extends LayerTool<SegmentationUserLayer> 
     return {
       nodeId: nodeIdRaw,
       segmentId:
-        typeof segmentIdRaw === "number" && Number.isSafeInteger(segmentIdRaw)
-          ? segmentIdRaw
+        typeof segmentIdRaw === "bigint" && segmentIdRaw > 0n
+          ? Number(segmentIdRaw)
           : undefined,
       position:
         position instanceof Float32Array
@@ -224,14 +224,10 @@ abstract class SpatialSkeletonToolBase extends LayerTool<SegmentationUserLayer> 
       return undefined;
     }
     const segmentIdRaw = this.mouseState.pickedSpatialSkeleton?.segmentId;
-    if (
-      typeof segmentIdRaw !== "number" ||
-      !Number.isSafeInteger(segmentIdRaw) ||
-      segmentIdRaw <= 0
-    ) {
+    if (typeof segmentIdRaw !== "bigint" || segmentIdRaw <= 0n) {
       return undefined;
     }
-    return segmentIdRaw;
+    return Number(segmentIdRaw);
   }
 
   protected selectSegmentByNumber(value: number) {

@@ -37,6 +37,7 @@ import { KvStoreFileHandle, readFileHandle } from "#src/kvstore/index.js";
 import type { Owned } from "#src/util/disposable.js";
 import { RefCounted } from "#src/util/disposable.js";
 import { convertEndian64, Endianness } from "#src/util/endian.js";
+import { maybeDecompressGzip } from "#src/util/gzip.js";
 import { murmurHash3_x86_128Hash64Bits_Bigint } from "#src/util/hash.js";
 import type { ProgressOptions } from "#src/util/progress_listener.js";
 
@@ -288,6 +289,155 @@ export class ShardedKvStore
     const response = await this.readWithShardInfo(key, options);
     if (response === undefined) return undefined;
     return response.response;
+  }
+
+  /**
+   * Reads many keys at once, decoded to their raw (post-`dataEncoding`) bytes.
+   *
+   * Unlike calling {@link read} per key (one HTTP range request each), this
+   * resolves every key through the cached minishard indices, groups the
+   * resulting byte ranges by shard, and coalesces ranges that are within
+   * `maxGapBytes` of each other into a single range request — so a dense
+   * minishard (whose entries are stored contiguously) collapses to one read.
+   * This is what makes "fetch every skeleton in a spatial chunk" tractable.
+   *
+   * Returns a map from key to its decoded bytes; missing keys are absent.
+   */
+  async readBatch(
+    keys: Iterable<bigint>,
+    options: Partial<ProgressOptions> & {
+      signal?: AbortSignal;
+      maxGapBytes?: number;
+      maxConcurrentReads?: number;
+    } = {},
+  ): Promise<Map<bigint, Uint8Array>> {
+    const { sharding } = this;
+    const { maxGapBytes = 2 * 1024 * 1024, maxConcurrentReads = 32 } = options;
+    const result = new Map<bigint, Uint8Array>();
+
+    interface Located {
+      key: bigint;
+      offset: number;
+      length: number;
+    }
+    const byShard = new Map<string, Located[]>();
+    const keyArray = Array.from(keys);
+    // Resolve each key to its shard + byte range; minishard indices are shared
+    // via `minishardIndexCache`, so each distinct minishard is fetched once.
+    // Best-effort: a key whose fragment is absent (e.g. a segment that has no
+    // skeleton, common when the spatial index is built over the segmentation)
+    // is simply skipped rather than failing the whole batch. The fan-out is
+    // bounded so a chunk listing tens of thousands of segments doesn't open
+    // that many connections at once.
+    let nextKey = 0;
+    const runKeyWorker = async () => {
+      while (true) {
+        const index = nextKey++;
+        if (index >= keyArray.length) return;
+        const key = keyArray[index];
+        let found;
+        try {
+          found = await this.findKey(key, options);
+        } catch (e) {
+          if (options.signal?.aborted) throw e;
+          found = undefined;
+        }
+        if (found === undefined) continue;
+        const { shardPath } = found.shardInfo;
+        let entries = byShard.get(shardPath);
+        if (entries === undefined) byShard.set(shardPath, (entries = []));
+        entries.push({
+          key,
+          offset: found.minishardEntry.offset,
+          length: found.minishardEntry.length,
+        });
+      }
+    };
+    {
+      const keyWorkers: Promise<void>[] = [];
+      for (let i = 0; i < Math.min(maxConcurrentReads, keyArray.length); ++i) {
+        keyWorkers.push(runKeyWorker());
+      }
+      await Promise.all(keyWorkers);
+    }
+
+    // Build coalesced range-read tasks across all shards.
+    interface RangeTask {
+      shardPath: string;
+      start: number;
+      end: number;
+      entries: Located[];
+    }
+    const tasks: RangeTask[] = [];
+    for (const [shardPath, entries] of byShard) {
+      entries.sort((a, b) => a.offset - b.offset);
+      let i = 0;
+      while (i < entries.length) {
+        const start = entries[i].offset;
+        let end = start + entries[i].length;
+        let j = i + 1;
+        while (j < entries.length && entries[j].offset - end <= maxGapBytes) {
+          end = Math.max(end, entries[j].offset + entries[j].length);
+          ++j;
+        }
+        tasks.push({ shardPath, start, end, entries: entries.slice(i, j) });
+        i = j;
+      }
+    }
+
+    const decodeEntry = async (
+      buffer: ArrayBuffer,
+      localOffset: number,
+      e: Located,
+    ) => {
+      if (sharding.dataEncoding === DataEncoding.GZIP) {
+        const decoded = await maybeDecompressGzip(
+          new Uint8Array(buffer, localOffset, e.length),
+        );
+        result.set(e.key, decoded);
+      } else {
+        result.set(
+          e.key,
+          new Uint8Array(buffer.slice(localOffset, localOffset + e.length)),
+        );
+      }
+    };
+
+    let nextTask = 0;
+    const runTaskWorker = async () => {
+      while (true) {
+        const index = nextTask++;
+        if (index >= tasks.length) return;
+        const task = tasks[index];
+        let buffer: ArrayBuffer;
+        try {
+          const response = await readFileHandle(
+            new KvStoreFileHandle(this.base.store, task.shardPath),
+            {
+              ...options,
+              byteRange: { offset: task.start, length: task.end - task.start },
+              strictByteRange: true,
+            },
+          );
+          if (response === undefined) continue;
+          buffer = await response.response.arrayBuffer();
+        } catch (e) {
+          // Best-effort: skip a coalesced range that fails to read rather than
+          // failing the whole chunk.
+          if (options.signal?.aborted) throw e;
+          continue;
+        }
+        for (const e of task.entries) {
+          await decodeEntry(buffer, e.offset - task.start, e);
+        }
+      }
+    };
+    const workers: Promise<void>[] = [];
+    for (let i = 0; i < Math.min(maxConcurrentReads, tasks.length); ++i) {
+      workers.push(runTaskWorker());
+    }
+    await Promise.all(workers);
+    return result;
   }
 
   get supportsOffsetReads() {

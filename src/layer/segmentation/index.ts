@@ -2264,11 +2264,9 @@ export class SegmentationUserLayer extends Base {
       pickedSpatialSkeleton.nodeId,
     );
     state.nodeId = nodeId === undefined ? undefined : nodeId.toString();
-    const segmentId = normalizeOptionalPositiveSafeInteger(
-      pickedSpatialSkeleton.segmentId,
-    );
-    if (segmentId !== undefined) {
-      state.value = BigInt(segmentId);
+    const segmentId = pickedSpatialSkeleton.segmentId;
+    if (typeof segmentId === "bigint" && segmentId > 0n) {
+      state.value = segmentId;
     }
   }
 

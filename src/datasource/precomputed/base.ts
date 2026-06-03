@@ -78,10 +78,19 @@ export class MultiscaleMeshSourceParameters {
   static RPC_ID = "precomputed/MultiscaleMeshSource";
 }
 
+export interface SkeletonSpatialIndexInfo {
+  // Voxel size (nm) of the coordinate system in which `chunkSize` and the
+  // `*.spatial` filename coordinates are expressed.
+  resolution: Float64Array;
+  // Spatial chunk size, in voxels at `resolution`.
+  chunkSize: Float64Array;
+}
+
 export interface SkeletonMetadata {
   transform: mat4;
   vertexAttributes: Map<string, VertexAttributeInfo>;
   sharding: ShardingParameters | undefined;
+  spatialIndex?: SkeletonSpatialIndexInfo | undefined;
 }
 
 export class SkeletonSourceParameters {
@@ -89,6 +98,17 @@ export class SkeletonSourceParameters {
   metadata: SkeletonMetadata;
 
   static RPC_ID = "precomputed/SkeletonSource";
+}
+
+export class PrecomputedSpatialSkeletonSourceParameters {
+  url: string;
+  metadata: SkeletonMetadata;
+  // Lower corner of the spatial chunk grid, in voxels at
+  // `metadata.spatialIndex.resolution`. The on-disk `*.spatial` filenames are
+  // laid out on a regular grid offset by this origin.
+  gridOrigin: Float32Array;
+
+  static RPC_ID = "precomputed/SpatialSkeletonSource";
 }
 
 export class AnnotationSpatialIndexSourceParameters {

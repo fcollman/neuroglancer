@@ -50,6 +50,7 @@ import type {
   MultiscaleMeshMetadata,
   ShardingParameters,
   SkeletonMetadata,
+  SkeletonSpatialIndexInfo,
 } from "#src/datasource/precomputed/base.js";
 import {
   AnnotationSourceParameters,
@@ -62,6 +63,7 @@ import {
   VolumeChunkEncoding,
   VolumeChunkSourceParameters,
 } from "#src/datasource/precomputed/base.js";
+import { PrecomputedMultiscaleSpatiallyIndexedSkeletonSource } from "#src/datasource/precomputed/skeleton_spatial.js";
 import type { AutoDetectRegistry } from "#src/kvstore/auto_detect.js";
 import { simpleFilePresenceAutoDetectDirectorySpec } from "#src/kvstore/auto_detect.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
@@ -622,15 +624,39 @@ function parseSkeletonMetadata(data: any): ParsedSkeletonMetadata {
     "sharding",
     parseShardingParameters,
   );
+  const spatialIndex = verifyObjectProperty(
+    data,
+    "spatial_index",
+    parseSkeletonSpatialIndex,
+  );
   const segmentPropertyMap = verifyObjectProperty(
     data,
     "segment_properties",
     verifyOptionalString,
   );
   return {
-    metadata: { transform, vertexAttributes, sharding } as SkeletonMetadata,
+    metadata: {
+      transform,
+      vertexAttributes,
+      sharding,
+      spatialIndex,
+    } as SkeletonMetadata,
     segmentPropertyMap,
   };
+}
+
+function parseSkeletonSpatialIndex(
+  obj: any,
+): SkeletonSpatialIndexInfo | undefined {
+  if (obj === undefined) return undefined;
+  verifyObject(obj);
+  const resolution = verifyObjectProperty(obj, "resolution", (x) =>
+    parseFixedLengthArray(new Float64Array(3), x, verifyFinitePositiveFloat),
+  );
+  const chunkSize = verifyObjectProperty(obj, "chunk_size", (x) =>
+    parseFixedLengthArray(new Float64Array(3), x, verifyFinitePositiveFloat),
+  );
+  return { resolution, chunkSize };
 }
 
 async function getSkeletonMetadata(
@@ -725,6 +751,7 @@ async function getSkeletonSource(
       },
     ),
     transform: metadata.transform,
+    metadata,
     segmentPropertyMap,
   };
 }
@@ -763,6 +790,54 @@ function getSubsourceToModelSubspaceTransform(info: MultiscaleVolumeInfo) {
     m[5 * i] = 1 / resolution[i];
   }
   return m;
+}
+
+// Builds the opt-in "show all skeletons in view" subsource for a precomputed
+// skeleton source that advertises a `spatial_index`, deriving the grid origin
+// and extent from the parent volume. Assumes the skeleton `transform` is the
+// identity (the common case); stored vertex coordinates are treated as
+// nanometers.
+function makeSpatialSkeletonSubsource(
+  sharedKvStoreContext: SharedKvStoreContext,
+  skeletonsUrl: string,
+  metadata: SkeletonMetadata,
+  spatialIndex: SkeletonSpatialIndexInfo,
+  info: MultiscaleVolumeInfo,
+): DataSubsourceEntry {
+  const baseScale = info.scales[0];
+  const resolution = baseScale.resolution; // nm per voxel
+  const { voxelOffset, size } = baseScale; // voxels
+  const gridOrigin = new Float32Array(3); // nm
+  const extentNm = new Float32Array(3);
+  const chunkSizeNm = new Float32Array(3);
+  for (let i = 0; i < 3; ++i) {
+    gridOrigin[i] = voxelOffset[i] * resolution[i];
+    extentNm[i] = size[i] * resolution[i];
+    chunkSizeNm[i] = spatialIndex.chunkSize[i];
+  }
+  const parameters = {
+    url: skeletonsUrl,
+    metadata,
+    gridOrigin,
+  };
+  const source = new PrecomputedMultiscaleSpatiallyIndexedSkeletonSource(
+    sharedKvStoreContext.chunkManager,
+    sharedKvStoreContext,
+    { parameters, chunkSizeNm, extentNm },
+  );
+  // Maps the gridOrigin-relative nm frame the backend packs into the volume's
+  // base-scale voxel model space: voxel = shiftedNm / resolution + voxelOffset.
+  const subsourceToModelSubspaceTransform = mat4.create();
+  for (let i = 0; i < 3; ++i) {
+    subsourceToModelSubspaceTransform[5 * i] = 1 / resolution[i];
+    subsourceToModelSubspaceTransform[12 + i] = voxelOffset[i];
+  }
+  return {
+    id: "skeleton-spatial",
+    default: false,
+    subsource: { mesh: source },
+    subsourceToModelSubspaceTransform,
+  };
 }
 
 async function getVolumeDataSource(
@@ -844,11 +919,11 @@ async function getVolumeDataSource(
         info.skeletons,
       ),
     );
-    const { source: skeletonSource, transform } = await getSkeletonSource(
-      sharedKvStoreContext,
-      skeletonsUrl,
-      options,
-    );
+    const {
+      source: skeletonSource,
+      transform,
+      metadata: skeletonMetadata,
+    } = await getSkeletonSource(sharedKvStoreContext, skeletonsUrl, options);
     const subsourceToModelSubspaceTransform =
       getSubsourceToModelSubspaceTransform(info);
     mat4.multiply(
@@ -862,6 +937,17 @@ async function getVolumeDataSource(
       subsource: { mesh: skeletonSource },
       subsourceToModelSubspaceTransform,
     });
+    if (skeletonMetadata.spatialIndex !== undefined) {
+      subsources.push(
+        makeSpatialSkeletonSubsource(
+          sharedKvStoreContext,
+          skeletonsUrl,
+          skeletonMetadata,
+          skeletonMetadata.spatialIndex,
+          info,
+        ),
+      );
+    }
   }
   return { modelTransform: makeIdentityTransform(modelSpace), subsources };
 }

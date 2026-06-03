@@ -822,7 +822,7 @@ describe("spatial_skeleton_edit_tool", () => {
     };
     const mouseState = {
       pickedRenderLayer: undefined,
-      pickedSpatialSkeleton: { segmentId: 17 },
+      pickedSpatialSkeleton: { segmentId: 17n },
       updateUnconditionally: vi.fn(() => true),
       active: true,
     };
