@@ -67,6 +67,8 @@ import {
   MeshSource,
   MultiscaleMeshSource,
 } from "#src/mesh/backend.js";
+import { parseMapBuffer } from "#src/datasource/precomputed/mapbuffer.js";
+import { decodeBrotli } from "#src/util/brotli.js";
 import { decodeDracoPartitioned } from "#src/mesh/draco/index.js";
 import type {
   SkeletonChunk,
@@ -659,10 +661,78 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
+type SpatialSkeletonFragment = ReturnType<
+  typeof decodeSpatialSkeletonFragment
+> & { id: bigint };
+
 function setEmptySpatialSkeletonChunk(chunk: SpatiallyIndexedSkeletonChunk) {
   chunk.vertexPositions = new Float32Array(0);
   chunk.indices = new Uint32Array(0);
   chunk.vertexAttributes = [new BigUint64Array(0)];
+}
+
+// Concatenates decoded fragments into a single chunk geometry: positions are
+// shifted into the gridOrigin-relative nm frame the chunk grid uses, edges are
+// re-based by the running vertex count, and the per-vertex segment-id (uint64)
+// attribute is filled with each fragment's label.
+function packSpatialSkeletonFragments(
+  chunk: SpatiallyIndexedSkeletonChunk,
+  fragments: ReadonlyArray<SpatialSkeletonFragment | undefined>,
+  gridOrigin: Float32Array,
+) {
+  let totalVertices = 0;
+  let totalIndices = 0;
+  for (const fragment of fragments) {
+    if (fragment === undefined) continue;
+    totalVertices += fragment.numVertices;
+    totalIndices += fragment.indices.length;
+  }
+
+  const vertexPositions = new Float32Array(totalVertices * 3);
+  const segmentIdAttribute = new BigUint64Array(totalVertices);
+  const indices = new Uint32Array(totalIndices);
+  let vertexOffset = 0;
+  let indexOffset = 0;
+  for (const fragment of fragments) {
+    if (fragment === undefined) continue;
+    const { numVertices, vertexPositions: fragPositions } = fragment;
+    for (let v = 0; v < numVertices; ++v) {
+      const src = v * 3;
+      const dst = (vertexOffset + v) * 3;
+      vertexPositions[dst] = fragPositions[src] - gridOrigin[0];
+      vertexPositions[dst + 1] = fragPositions[src + 1] - gridOrigin[1];
+      vertexPositions[dst + 2] = fragPositions[src + 2] - gridOrigin[2];
+      segmentIdAttribute[vertexOffset + v] = fragment.id;
+    }
+    const { indices: fragIndices } = fragment;
+    for (let e = 0; e < fragIndices.length; ++e) {
+      indices[indexOffset + e] = fragIndices[e] + vertexOffset;
+    }
+    vertexOffset += numVertices;
+    indexOffset += fragIndices.length;
+  }
+
+  chunk.vertexPositions = vertexPositions;
+  chunk.indices = indices;
+  chunk.vertexAttributes = [segmentIdAttribute];
+}
+
+// Decompresses one MapBuffer blob according to the file's declared compression.
+async function decompressMapBufferBlob(
+  compression: string,
+  data: Uint8Array<ArrayBuffer>,
+): Promise<Uint8Array> {
+  switch (compression) {
+    case "none":
+      return data;
+    case "00br": // brotli
+      return decodeBrotli(data);
+    case "gzip":
+      return maybeDecompressGzip(data);
+    default:
+      // zstd/lzma are valid MapBuffer codecs but not yet wired here.
+      throw new Error(`Unsupported .frags compression: ${compression}`);
+  }
 }
 
 @registerSharedObject()
@@ -678,11 +748,84 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
     this.kvStore,
     this.parameters.metadata.sharding,
   );
+  // Set once we determine this source has no `.frags` files (a `.frags` miss
+  // accompanied by a `.spatial` hit), so subsequent chunks skip the `.frags`
+  // probe and go straight to the sharded fallback.
+  private fragsUnavailable = false;
 
   async download(chunk: SpatiallyIndexedSkeletonChunk, signal: AbortSignal) {
+    const { gridOrigin } = this.parameters;
+    const { chunkGridPosition } = chunk;
+
+    // Primary path: the per-chunk `.frags` MapBuffer (one request for every
+    // skeleton in the chunk).
+    if (!this.fragsUnavailable) {
+      const fragments = await this.downloadFrags(chunkGridPosition, signal);
+      if (fragments !== undefined) {
+        packSpatialSkeletonFragments(chunk, fragments, gridOrigin);
+        return;
+      }
+    }
+
+    // Fallback: `.spatial` index + per-segment fragments from the (sharded)
+    // store.
+    await this.downloadFromSpatial(chunk, chunkGridPosition, signal);
+  }
+
+  // Reads and decodes the `.frags` MapBuffer for a chunk. Returns the decoded
+  // fragments, or `undefined` if the `.frags` file is absent (caller falls
+  // back). An empty-but-present `.frags` returns `[]`.
+  private async downloadFrags(
+    chunkGridPosition: Float32Array,
+    signal: AbortSignal,
+  ): Promise<SpatialSkeletonFragment[] | undefined> {
+    const { metadata, gridOrigin } = this.parameters;
+    const { chunkSize, resolution } = metadata.spatialIndex!;
+    // `.frags` filenames are in voxels at the skeleton resolution.
+    const lower = new Array<number>(3);
+    const upper = new Array<number>(3);
+    for (let i = 0; i < 3; ++i) {
+      const chunkVox = Math.round(chunkSize[i] / resolution[i]);
+      const originVox = Math.round(gridOrigin[i] / resolution[i]);
+      lower[i] = originVox + chunkGridPosition[i] * chunkVox;
+      upper[i] = lower[i] + chunkVox;
+    }
+    const name =
+      `${lower[0]}-${upper[0]}_` +
+      `${lower[1]}-${upper[1]}_` +
+      `${lower[2]}-${upper[2]}.frags`;
+    const response = await this.kvStore.store.read(
+      `${this.kvStore.path}${name}`,
+      { signal },
+    );
+    if (response === undefined) return undefined;
+    const { compression, entries } = parseMapBuffer(
+      await response.response.arrayBuffer(),
+    );
+    const fragments: SpatialSkeletonFragment[] = [];
+    for (const entry of entries) {
+      const skeletonBytes = await decompressMapBufferBlob(
+        compression,
+        entry.data,
+      );
+      fragments.push({
+        id: entry.label,
+        ...decodeSpatialSkeletonFragment(toArrayBuffer(skeletonBytes)),
+      });
+    }
+    return fragments;
+  }
+
+  // Reads the `.spatial` JSON index (nm-named) and fetches each listed skeleton
+  // fragment. For sharded stores, `readBatch` coalesces what would be one HTTP
+  // range request per segment into a few per-minishard reads.
+  private async downloadFromSpatial(
+    chunk: SpatiallyIndexedSkeletonChunk,
+    chunkGridPosition: Float32Array,
+    signal: AbortSignal,
+  ) {
     const { metadata, gridOrigin } = this.parameters;
     const chunkSize = metadata.spatialIndex!.chunkSize;
-    const { chunkGridPosition } = chunk;
 
     // Absolute (nanometer) bounding box of this chunk; the `.spatial` files are
     // named by their nm bbox on a grid offset by `gridOrigin`.
@@ -700,10 +843,14 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
       { signal },
     );
     if (indexResponse === undefined) {
-      // No spatial index file for this chunk (outside the dataset, or empty).
+      // Neither `.frags` nor `.spatial` for this chunk: empty.
       setEmptySpatialSkeletonChunk(chunk);
       return;
     }
+    // `.spatial` exists but `.frags` did not: this source uses the sharded
+    // layout, so skip the `.frags` probe for future chunks.
+    this.fragsUnavailable = true;
+
     const indexBytes = await maybeDecompressGzip(
       await indexResponse.response.arrayBuffer(),
     );
@@ -714,14 +861,8 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
       return;
     }
 
-    // Fetch and decode every skeleton fragment listed in the index. For sharded
-    // stores, `readBatch` coalesces what would be one HTTP range request per
-    // segment into a few per-minishard reads.
     const { shardedKvStore } = this;
-    type Fragment =
-      | (ReturnType<typeof decodeSpatialSkeletonFragment> & { id: bigint })
-      | undefined;
-    let fragments: Fragment[];
+    let fragments: Array<SpatialSkeletonFragment | undefined>;
     if (shardedKvStore !== undefined) {
       const dataMap = await shardedKvStore.readBatch(segmentIds, { signal });
       fragments = segmentIds.map((id) => {
@@ -742,42 +883,7 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
       });
     }
 
-    let totalVertices = 0;
-    let totalIndices = 0;
-    for (const fragment of fragments) {
-      if (fragment === undefined) continue;
-      totalVertices += fragment.numVertices;
-      totalIndices += fragment.indices.length;
-    }
-
-    const vertexPositions = new Float32Array(totalVertices * 3);
-    const segmentIdAttribute = new BigUint64Array(totalVertices);
-    const indices = new Uint32Array(totalIndices);
-    let vertexOffset = 0;
-    let indexOffset = 0;
-    for (const fragment of fragments) {
-      if (fragment === undefined) continue;
-      const { numVertices, vertexPositions: fragPositions } = fragment;
-      // Shift into the gridOrigin-relative nm frame used by the chunk grid.
-      for (let v = 0; v < numVertices; ++v) {
-        const src = v * 3;
-        const dst = (vertexOffset + v) * 3;
-        vertexPositions[dst] = fragPositions[src] - gridOrigin[0];
-        vertexPositions[dst + 1] = fragPositions[src + 1] - gridOrigin[1];
-        vertexPositions[dst + 2] = fragPositions[src + 2] - gridOrigin[2];
-        segmentIdAttribute[vertexOffset + v] = fragment.id;
-      }
-      const { indices: fragIndices } = fragment;
-      for (let e = 0; e < fragIndices.length; ++e) {
-        indices[indexOffset + e] = fragIndices[e] + vertexOffset;
-      }
-      vertexOffset += numVertices;
-      indexOffset += fragIndices.length;
-    }
-
-    chunk.vertexPositions = vertexPositions;
-    chunk.indices = indices;
-    chunk.vertexAttributes = [segmentIdAttribute];
+    packSpatialSkeletonFragments(chunk, fragments, gridOrigin);
   }
 }
 
