@@ -198,6 +198,20 @@ const DEFAULT_FRAGMENT_MAIN = `void main() {
 }
 `;
 
+// Directional ("color-by-orientation") skeleton shader usable with any skeleton
+// source: `prop_tangent()` is a built-in (per-edge direction; see
+// `RenderHelper`), or the synthesized per-vertex tangent for zarr-vectors
+// streamlines. Nodes / direction-less vertices fall back to the normal color.
+export const DIRECTIONAL_SKELETON_FRAGMENT_MAIN = `void main() {
+  vec3 t = prop_tangent();
+  if (t == vec3(0.0)) {
+    emitDefault();
+  } else {
+    emitRGB(vec3(abs(t.x), abs(t.y), abs(t.z)));
+  }
+}
+`;
+
 const SELECTED_NODE_OUTLINE_COLOR_RGB = "1.0, 0.95, 0.35";
 const SELECTED_NODE_OUTLINE_MIN_WIDTH_2D = "1.75";
 const SELECTED_NODE_OUTLINE_MAX_WIDTH_2D = "3.0";
@@ -288,6 +302,10 @@ class RenderHelper extends RefCounted {
   private segmentAttributeIndex: number | undefined;
   private segmentColorAttributeIndex: number | undefined;
   private selectedNodeAttributeIndex: number | undefined;
+  // When the source has no per-vertex `tangent` attribute (everything except
+  // zarr-vectors streamlines), expose a built-in `prop_tangent()` computed from
+  // the edge direction so any skeleton shader can do directional coloring.
+  private hasTangentAttribute = false;
   private visibleSegmentsShaderManager = new HashSetShaderManager(
     "visibleSegments",
   );
@@ -325,6 +343,12 @@ class RenderHelper extends RefCounted {
     builder.addVarying("highp uint", "vPickID", "flat");
     builder.addUniform("highp uint", "uPickInstanceStride");
     this.defineAttributeAccess(builder);
+    if (!this.hasTangentAttribute) {
+      // Per-edge direction, fed to the built-in `prop_tangent()` (see
+      // `finalizeShaderBuilder`). Zero for nodes (a lone vertex has no
+      // direction).
+      builder.addVarying("highp vec3", "vEdgeTangent");
+    }
     if (skeletonParams.dynamicSegmentAppearance) {
       this.defineDynamicSegmentAppearance(builder, skeletonParams);
     }
@@ -380,6 +404,15 @@ void spatialChunkCull() {
       vertexMain += `vCustom${i} = readAttribute${i}(vertexIndex);\n`;
       builder.addFragmentCode(`#define ${info.name} vCustom${i}\n`);
       builder.addFragmentCode(`#define prop_${info.name}() vCustom${i}\n`);
+    }
+    if (!this.hasTangentAttribute) {
+      // Built-in directional tangent for sources without a `tangent` attribute:
+      // the per-edge direction (zero for nodes). Lets `prop_tangent()`-based
+      // directional shaders (e.g. DIRECTIONAL_SKELETON_FRAGMENT_MAIN) work for
+      // every skeleton source, matching zarr-vectors' attribute-backed macro.
+      builder.addFragmentCode(
+        `highp vec3 prop_tangent() { return vEdgeTangent; }\n`,
+      );
     }
     builder.setVertexMain(vertexMain);
     addControlsToBuilder(shaderBuilderState, builder);
@@ -605,6 +638,9 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
     );
     this.selectedNodeAttributeIndex =
       selectedNodeAttrIndex >= 0 ? selectedNodeAttrIndex : undefined;
+    this.hasTangentAttribute = this.vertexAttributes.some(
+      (x) => x.name === "tangent",
+    );
 
     const segmentationGroupState =
       base.displayState.segmentationGroupState.value;
@@ -663,6 +699,9 @@ highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexInde
 `;
           if (skeletonParams.spatialChunkCulling) {
             vertexMain += `vCullPos = mix(vertexA, vertexB, float(lineEndpointIndex));\n`;
+          }
+          if (!this.hasTangentAttribute) {
+            vertexMain += `{ highp vec3 _edge = vertexB - vertexA; vEdgeTangent = length(_edge) > 0.0 ? normalize(_edge) : vec3(0.0); }\n`;
           }
           if (
             skeletonParams.dynamicSegmentAppearance &&
@@ -784,6 +823,10 @@ highp vec3 vertexPosition = readAttribute0(vertexIndex);
 `;
           if (skeletonParams.spatialChunkCulling) {
             vertexMain += `vCullPos = vertexPosition;\n`;
+          }
+          if (!this.hasTangentAttribute) {
+            // A node is a single vertex with no direction.
+            vertexMain += `vEdgeTangent = vec3(0.0);\n`;
           }
           if (this.selectedNodeAttributeIndex !== undefined) {
             vertexMain += `vSelectedNode = readAttribute${this.selectedNodeAttributeIndex}(vertexIndex);\n`;
@@ -3197,6 +3240,7 @@ export class SpatiallyIndexedSkeletonLayer
     lineWidth: number,
     pointDiameter: number,
     visibleChunks: VisibleChunk[],
+    renderNodes: boolean,
   ) {
     if (visibleChunks.length === 0) return;
     const hasExcludedSegments =
@@ -3220,8 +3264,10 @@ export class SpatiallyIndexedSkeletonLayer
         vec3.add(chunkBound, chunkOrigin, chunkLayout.size);
         edgeShader.bind();
         renderHelper.setChunkBounds(gl, edgeShader, chunkOrigin, chunkBound);
-        nodeShader.bind();
-        renderHelper.setChunkBounds(gl, nodeShader, chunkOrigin, chunkBound);
+        if (renderNodes) {
+          nodeShader.bind();
+          renderHelper.setChunkBounds(gl, nodeShader, chunkOrigin, chunkBound);
+        }
       }
       if (renderContext.emitPickID) {
         let edgePickId = 0;
@@ -3240,7 +3286,7 @@ export class SpatiallyIndexedSkeletonLayer
           );
           edgePickStride = 1;
         }
-        if (chunk.numVertices > 0) {
+        if (renderNodes && chunk.numVertices > 0) {
           nodePickId = renderContext.pickIDs.register(
             layer,
             chunk.numVertices,
@@ -3255,9 +3301,11 @@ export class SpatiallyIndexedSkeletonLayer
         edgeShader.bind();
         renderHelper.setPickID(gl, edgeShader, edgePickId);
         renderHelper.setPickInstanceStride(gl, edgeShader, edgePickStride);
-        nodeShader.bind();
-        renderHelper.setPickID(gl, nodeShader, nodePickId);
-        renderHelper.setPickInstanceStride(gl, nodeShader, nodePickStride);
+        if (renderNodes) {
+          nodeShader.bind();
+          renderHelper.setPickID(gl, nodeShader, nodePickId);
+          renderHelper.setPickInstanceStride(gl, nodeShader, nodePickStride);
+        }
       }
       // Render each chunk with different node/edge colors for debugging
       if (DEBUG_SPATIAL_SKELETON_CHUNKS) {
@@ -3291,7 +3339,7 @@ export class SpatiallyIndexedSkeletonLayer
       renderHelper.drawSkeletons(
         gl,
         edgeShader,
-        nodeShader,
+        renderNodes ? nodeShader : null,
         chunk,
         renderContext.projectionParameters,
       );
@@ -3412,6 +3460,11 @@ export class SpatiallyIndexedSkeletonLayer
       renderOptions.mode.value,
       lineWidth,
     );
+    // In "lines" mode, skip the per-vertex node dots entirely (as the
+    // non-spatial skeleton layer does) — otherwise every vertex draws a dot,
+    // which dominates the view (especially in 2D cross-section).
+    const renderNodes =
+      renderOptions.mode.value === SkeletonRenderMode.LINES_AND_POINTS;
 
     this.drawBrowsePass(
       renderContext,
@@ -3421,6 +3474,7 @@ export class SpatiallyIndexedSkeletonLayer
       lineWidth,
       pointDiameter,
       visibleChunks,
+      renderNodes,
     );
     this.drawInspectionOverlayPass(
       renderContext,
