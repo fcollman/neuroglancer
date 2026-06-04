@@ -212,6 +212,19 @@ export const DIRECTIONAL_SKELETON_FRAGMENT_MAIN = `void main() {
 }
 `;
 
+// Whether the user skeleton shader defines a `getLineWidth()` hook. When it
+// does, the edge shader compiles the shader into the vertex stage so the hook
+// can drive the per-edge line width (in pixels), e.g. world-space width clamped
+// to a minimum:
+//   float getLineWidth() {
+//     return max(2.0, prop_radius() * 2.0 * ngPixelsPerWorldUnit());
+//   }
+function userDefinesGetLineWidth(
+  shaderBuilderState: ShaderControlsBuilderState,
+): boolean {
+  return /\bgetLineWidth\b/.test(shaderBuilderState.parseResult.code);
+}
+
 const SELECTED_NODE_OUTLINE_COLOR_RGB = "1.0, 0.95, 0.35";
 const SELECTED_NODE_OUTLINE_MIN_WIDTH_2D = "1.75";
 const SELECTED_NODE_OUTLINE_MAX_WIDTH_2D = "3.0";
@@ -375,7 +388,19 @@ void spatialChunkCull() {
     shaderBuilderState: ShaderControlsBuilderState,
     skeletonParams: SkeletonShaderParameters,
     vertexMain: string,
+    // Per-shader vertex-stage config enabling the `getLineWidth()` hook (edge
+    // and node both support it). `vertexIndexExpr` is the GLSL expression for
+    // the vertex index to read per-vertex properties at (edge endpoint A vs the
+    // node's vertex); `viewportUniform` is the `(1/w,1/h,*)` uniform of that
+    // shader (`uLineParams` for edges, `uCircleParams` for nodes).
+    widthHookConfig?: { vertexIndexExpr: string; viewportUniform: string },
   ): void {
+    // Whether the user shader defines a `getLineWidth()` hook. Detected here so
+    // every shader adds the fragment-stage stub (the hook is dead code in the
+    // fragment stage but must still compile).
+    const widthHookPresent = userDefinesGetLineWidth(shaderBuilderState);
+    const vertexWidthHook = widthHookPresent && widthHookConfig !== undefined;
+    const vertexIndexExpr = widthHookConfig?.vertexIndexExpr ?? "";
     builder.addFragmentCode(glsl_COLORMAPS);
     const { vertexAttributes } = this;
     const numAttributes = vertexAttributes.length;
@@ -391,6 +416,13 @@ void spatialChunkCull() {
       builder.addFragmentCode(
         `#define prop_${segInfo.name}() ${segInfo.glslDataType}(vSegmentValue)\n`,
       );
+      if (vertexWidthHook) {
+        // Vertex value of the segment id for `getLineWidth()`.
+        builder.addVertexCode(
+          `#define prop_${segInfo.name}() readAttribute${this.segmentAttributeIndex}(${vertexIndexExpr})\n` +
+            `#define ${segInfo.name} readAttribute${this.segmentAttributeIndex}(${vertexIndexExpr})\n`,
+        );
+      }
     }
     for (let i = 1; i < numAttributes; ++i) {
       if (
@@ -404,6 +436,13 @@ void spatialChunkCull() {
       vertexMain += `vCustom${i} = readAttribute${i}(vertexIndex);\n`;
       builder.addFragmentCode(`#define ${info.name} vCustom${i}\n`);
       builder.addFragmentCode(`#define prop_${info.name}() vCustom${i}\n`);
+      if (vertexWidthHook) {
+        // Same property in the vertex stage.
+        builder.addVertexCode(
+          `#define ${info.name} readAttribute${i}(${vertexIndexExpr})\n` +
+            `#define prop_${info.name}() readAttribute${i}(${vertexIndexExpr})\n`,
+        );
+      }
     }
     if (!this.hasTangentAttribute) {
       // Built-in directional tangent for sources without a `tangent` attribute:
@@ -413,6 +452,20 @@ void spatialChunkCull() {
       builder.addFragmentCode(
         `highp vec3 prop_tangent() { return vEdgeTangent; }\n`,
       );
+      if (vertexWidthHook) {
+        builder.addVertexCode(
+          `highp vec3 prop_tangent() { return vEdgeTangent; }\n`,
+        );
+      }
+    }
+    if (widthHookPresent) {
+      // The user source (which defines `getLineWidth()`) is compiled into the
+      // fragment stage of every skeleton shader (edge and node) for `main()`.
+      // `getLineWidth()` is dead code there but must still compile, so provide a
+      // fragment-stage stub of the vertex-only `ngPixelsPerWorldUnit()` helper
+      // (its return value is irrelevant since `getLineWidth()` is never called
+      // in the fragment stage).
+      builder.addFragmentCode(`float ngPixelsPerWorldUnit() { return 0.0; }\n`);
     }
     builder.setVertexMain(vertexMain);
     addControlsToBuilder(shaderBuilderState, builder);
@@ -427,6 +480,52 @@ void spatialChunkCull() {
         ? "spatialChunkCull();\nuserMain();"
         : "userMain();",
     );
+    if (vertexWidthHook) {
+      this.addVertexWidthHook(
+        builder,
+        shaderBuilderState,
+        widthHookConfig!.viewportUniform,
+      );
+    }
+  }
+
+  // Compiles the user shader into the vertex stage so its `getLineWidth()` can
+  // size each edge/node. Provides the documented skeleton-shader API in the
+  // vertex stage (colormaps, no-op `emit*`, `prop_*` defined above, and the
+  // `ngPixelsPerWorldUnit()` world->pixel helper). The color `main()` is
+  // compiled but unused here; a width-hook shader must only use these builtins.
+  // `viewportUniform` is the shader's `(1/width, 1/height, *)` uniform.
+  private addVertexWidthHook(
+    builder: ShaderBuilder,
+    shaderBuilderState: ShaderControlsBuilderState,
+    viewportUniform: string,
+  ): void {
+    builder.addVertexCode(glsl_COLORMAPS);
+    builder.addVertexCode(`
+void emitRGB(highp vec3 color) {}
+void emitRGBA(highp vec4 color) {}
+void emitDefault() {}
+highp float ng_pixelsPerWorldUnit;
+float ngPixelsPerWorldUnit() { return ng_pixelsPerWorldUnit; }
+// Approximate screen pixels per world unit between two world points (exact for
+// the orthographic 2D slice view; depth-averaged under perspective). Pass the
+// same point twice for a node.
+float ngComputePixelsPerWorldUnit(highp vec3 a, highp vec3 b) {
+  highp vec4 clipA = uProjection * vec4(a, 1.0);
+  highp vec4 clipB = uProjection * vec4(b, 1.0);
+  highp float w = max(1e-6, 0.5 * (abs(clipA.w) + abs(clipB.w)));
+  highp float sx = length(vec3(uProjection[0].x, uProjection[1].x, uProjection[2].x));
+  highp float sy = length(vec3(uProjection[0].y, uProjection[1].y, uProjection[2].y));
+  highp float viewportW = 1.0 / ${viewportUniform}.x;
+  highp float viewportH = 1.0 / ${viewportUniform}.y;
+  return 0.5 * (sx / w * (viewportW * 0.5) + sy / w * (viewportH * 0.5));
+}
+`);
+    builder.addVertexCode(
+      "#define main ngUnusedColorMain\n" +
+        shaderCodeWithLineDirective(shaderBuilderState.parseResult.code) +
+        "\n#undef main\n",
+    );
   }
 
   private getSegmentColorExpression() {
@@ -435,6 +534,18 @@ void spatialChunkCull() {
       return "uColor";
     }
     return `vCustom${index}`;
+  }
+
+  // GLSL statement emitting an (rgb, alpha) color with the alpha convention the
+  // target expects: the 2D slice view blends with straight alpha
+  // (`SRC_ALPHA, ONE_MINUS_SRC_ALPHA`), while the perspective OIT path requires
+  // premultiplied color. Emitting premultiplied into the slice view's straight
+  // blend would multiply rgb by alpha twice, darkening (rather than fading)
+  // colors as the cross-section fade lowers alpha.
+  private emitColorStatement(rgb: string, alpha: string): string {
+    return this.targetIsSliceView
+      ? `emit(vec4(${rgb}, ${alpha}), vPickID);`
+      : `emit(vec4((${rgb}) * (${alpha}), ${alpha}), vPickID);`;
   }
 
   edgeShaderGetter;
@@ -688,12 +799,12 @@ vec4 getSegmentAppearance(highp uvec2 segmentValue) {
           defineLineShader(builder);
           builder.addAttribute("highp uvec2", "aVertexIndex");
           builder.addUniform("highp float", "uLineWidth");
+          const widthHook = userDefinesGetLineWidth(shaderBuilderState);
           let vertexMain = `
 highp uint pickOffset = uint(gl_InstanceID) * uPickInstanceStride;
 vPickID = uPickID + pickOffset;
 highp vec3 vertexA = readAttribute0(aVertexIndex.x);
 highp vec3 vertexB = readAttribute0(aVertexIndex.y);
-emitLine(uProjection, vertexA, vertexB, uLineWidth);
 highp uint lineEndpointIndex = getLineEndpointIndex();
 highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexIndex.y * lineEndpointIndex;
 `;
@@ -708,6 +819,16 @@ highp uint vertexIndex = aVertexIndex.x * (1u - lineEndpointIndex) + aVertexInde
             this.segmentAttributeIndex !== undefined
           ) {
             vertexMain += `vSegmentValue = readAttribute${this.segmentAttributeIndex}(aVertexIndex.x).value;\n`;
+          }
+          if (widthHook) {
+            // World-space line width: the user's `getLineWidth()` runs here in
+            // the vertex stage (see `addVertexWidthHook`). `ng_pixelsPerWorldUnit`
+            // is the screen pixels per world unit at this edge, so the shader can
+            // express width in world units and clamp to a minimum pixel size.
+            vertexMain += `ng_pixelsPerWorldUnit = ngComputePixelsPerWorldUnit(vertexA, vertexB);\n`;
+            vertexMain += `emitLine(uProjection, vertexA, vertexB, getLineWidth());\n`;
+          } else {
+            vertexMain += `emitLine(uProjection, vertexA, vertexB, uLineWidth);\n`;
           }
 
           const segmentColorExpression = this.getSegmentColorExpression();
@@ -727,13 +848,13 @@ void emitRGB(vec3 color) {
   vec4 baseColor = segmentColor();
   highp float alpha = baseColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
   if (alpha <= 0.0) discard;
-  emit(vec4(color * alpha, alpha), vPickID);
+  ${this.emitColorStatement("color", "alpha")}
 }
 void emitDefault() {
   vec4 baseColor = segmentColor();
   highp float alpha = baseColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()};
   if (alpha <= 0.0) discard;
-  emit(vec4(baseColor.rgb * alpha, alpha), vPickID);
+  ${this.emitColorStatement("baseColor.rgb", "alpha")}
 }
 `);
           } else if (this.segmentColorAttributeIndex === undefined) {
@@ -774,6 +895,10 @@ void emitDefault() {
             shaderBuilderState,
             skeletonParams,
             vertexMain,
+            {
+              vertexIndexExpr: "aVertexIndex.x",
+              viewportUniform: "uLineParams",
+            },
           );
         },
       },
@@ -804,6 +929,10 @@ void emitDefault() {
             /*crossSectionFade=*/ this.targetIsSliceView,
           );
           builder.addUniform("highp float", "uNodeDiameter");
+          // When the user defines `getLineWidth()`, size nodes by it too (so the
+          // node circles match the line width and fill the gaps between edge
+          // segments) instead of the uniform `uNodeDiameter`.
+          const widthHook = userDefinesGetLineWidth(shaderBuilderState);
           let selectedOutlineWidthExpression = "0.0";
           if (this.selectedNodeAttributeIndex !== undefined) {
             builder.addVarying("highp float", "vSelectedNode", "flat");
@@ -837,10 +966,16 @@ highp vec3 vertexPosition = readAttribute0(vertexIndex);
           ) {
             vertexMain += `vSegmentValue = readAttribute${this.segmentAttributeIndex}(vertexIndex).value;\n`;
           }
+          if (widthHook) {
+            vertexMain += `ng_pixelsPerWorldUnit = ngComputePixelsPerWorldUnit(vertexPosition, vertexPosition);\n`;
+          }
+          const nodeDiameterExpr = widthHook
+            ? "getLineWidth()"
+            : "uNodeDiameter";
           vertexMain += `
 emitCircle(
   uProjection * vec4(vertexPosition, 1.0),
-  uNodeDiameter,
+  ${nodeDiameterExpr},
   ${selectedOutlineWidthExpression}
 );
 `;
@@ -872,7 +1007,7 @@ void emitRGBA(vec4 color) {
   vec4 renderColor = vec4(color.rgb, alpha);
   vec4 borderColor = ${borderColorExpression};
   vec4 circleColor = getCircleColor(renderColor, borderColor);
-  emit(vec4(circleColor.rgb * circleColor.a, circleColor.a), vPickID);
+  ${this.emitColorStatement("circleColor.rgb", "circleColor.a")}
 }
 void emitRGB(vec3 color) {
   emitRGBA(vec4(color, 1.0));
@@ -934,6 +1069,12 @@ void emitDefault() {
             shaderBuilderState,
             skeletonParams,
             vertexMain,
+            // Use `gl_InstanceID` (a built-in, in scope inside `getLineWidth()`)
+            // rather than the `vertexIndex` local of `main()`.
+            {
+              vertexIndexExpr: "uint(gl_InstanceID)",
+              viewportUniform: "uCircleParams",
+            },
           );
         },
       },

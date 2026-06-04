@@ -35,27 +35,137 @@ import { WithParameters } from "#src/chunk_manager/frontend.js";
 import { PrecomputedSpatialSkeletonSourceParameters } from "#src/datasource/precomputed/base.js";
 import { WithSharedKvStoreContext } from "#src/kvstore/chunk_source_frontend.js";
 import type { SharedKvStoreContext } from "#src/kvstore/frontend.js";
+import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import {
   MultiscaleSpatiallyIndexedSkeletonSource,
   SPATIAL_SKELETON_SOURCE_OPTIONS,
   SpatiallyIndexedSkeletonSource,
   type SpatiallyIndexedSkeletonChunkSpecification,
 } from "#src/skeleton/frontend.js";
-import { makeSliceViewChunkSpecification } from "#src/sliceview/base.js";
 import type { SliceViewSourceOptions } from "#src/sliceview/base.js";
+import { makeSliceViewChunkSpecification } from "#src/sliceview/base.js";
 import { ChunkLayout } from "#src/sliceview/chunk_layout.js";
 import type { SliceViewSingleResolutionSource } from "#src/sliceview/frontend.js";
+import { DataType } from "#src/util/data_type.js";
 import { mat4, vec3 } from "#src/util/geom.js";
+import { getShaderType } from "#src/webgl/shader_lib.js";
+import {
+  computeTextureFormat,
+  TextureFormat,
+} from "#src/webgl/texture_access.js";
 
 // 1 nanometer expressed in meters; chunk coordinates are in nm and the render
 // layer's display space is in meters, so the chunk layout scales nm -> m
 // (matching the CATMAID spatial skeleton source).
 const NANOMETERS_TO_METERS = 1e-9;
 
+// Shape the spatially-indexed skeleton render layer reads off each vertex
+// attribute (matches the non-exported `VertexAttributeRenderInfo` in
+// skeleton/frontend.ts).
+interface SpatialVertexAttributeRenderInfo {
+  name: string;
+  dataType: DataType;
+  numComponents: number;
+  webglDataType: number;
+  glslDataType: string;
+}
+
+function webglDataTypeFor(dataType: DataType): number {
+  switch (dataType) {
+    case DataType.FLOAT32:
+      return WebGL2RenderingContext.FLOAT;
+    case DataType.UINT8:
+      return WebGL2RenderingContext.UNSIGNED_BYTE;
+    case DataType.INT8:
+      return WebGL2RenderingContext.BYTE;
+    case DataType.UINT16:
+      return WebGL2RenderingContext.UNSIGNED_SHORT;
+    case DataType.INT16:
+      return WebGL2RenderingContext.SHORT;
+    case DataType.UINT32:
+    case DataType.UINT64:
+      return WebGL2RenderingContext.UNSIGNED_INT;
+    case DataType.INT32:
+      return WebGL2RenderingContext.INT;
+    default:
+      throw new Error(`Unsupported skeleton attribute DataType: ${dataType}`);
+  }
+}
+
+// Builds the render-layer attribute list: position (slot 0, implicit), the
+// uint64 `segment` id (slot 1, must match the base source so picking/coloring
+// work), then the info file's per-vertex attributes (e.g. radius,
+// cross_sectional_area) so they are uploaded and exposed as `prop_<name>()`.
+// Order matches what the backend packs into `chunk.vertexAttributes`.
+function buildPrecomputedSpatialVertexAttributes(
+  vertexAttributes: Map<string, VertexAttributeInfo>,
+): SpatialVertexAttributeRenderInfo[] {
+  const out: SpatialVertexAttributeRenderInfo[] = [
+    {
+      name: "",
+      dataType: DataType.FLOAT32,
+      numComponents: 3,
+      webglDataType: WebGL2RenderingContext.FLOAT,
+      glslDataType: "vec3",
+    },
+    {
+      name: "segment",
+      dataType: DataType.UINT64,
+      numComponents: 1,
+      webglDataType: WebGL2RenderingContext.UNSIGNED_INT,
+      glslDataType: getShaderType(DataType.UINT64, 1),
+    },
+    // Synthesized per-vertex tangent (unit average of incident edge
+    // directions), packed by the backend. Drives `prop_tangent()` for
+    // directional coloring of both edges and nodes.
+    {
+      name: "tangent",
+      dataType: DataType.FLOAT32,
+      numComponents: 3,
+      webglDataType: WebGL2RenderingContext.FLOAT,
+      glslDataType: "vec3",
+    },
+  ];
+  for (const [name, info] of vertexAttributes) {
+    out.push({
+      name,
+      dataType: info.dataType,
+      numComponents: info.numComponents,
+      webglDataType: webglDataTypeFor(info.dataType),
+      glslDataType: getShaderType(info.dataType, info.numComponents),
+    });
+  }
+  return out;
+}
+
 export class PrecomputedSpatiallyIndexedSkeletonSource extends WithParameters(
   WithSharedKvStoreContext(SpatiallyIndexedSkeletonSource),
   PrecomputedSpatialSkeletonSourceParameters,
-) {}
+) {
+  private precomputedAttributeTextureFormats_?: TextureFormat[];
+
+  constructor(
+    ...args: ConstructorParameters<typeof SpatiallyIndexedSkeletonSource>
+  ) {
+    super(...args);
+    // Replace the base `[position, segment]` with one that also exposes the
+    // info file's per-vertex attributes (matches the backend's packing).
+    this.vertexAttributes = buildPrecomputedSpatialVertexAttributes(
+      this.parameters.metadata.vertexAttributes,
+    );
+  }
+
+  get attributeTextureFormats(): TextureFormat[] {
+    let cached = this.precomputedAttributeTextureFormats_;
+    if (cached === undefined) {
+      cached = this.precomputedAttributeTextureFormats_ =
+        this.vertexAttributes.map(({ dataType, numComponents }) =>
+          computeTextureFormat(new TextureFormat(), dataType, numComponents),
+        );
+    }
+    return cached;
+  }
+}
 
 export class PrecomputedMultiscaleSpatiallyIndexedSkeletonSource extends MultiscaleSpatiallyIndexedSkeletonSource {
   private readonly chunkSizeNm: Float32Array;

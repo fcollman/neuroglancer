@@ -77,6 +77,7 @@ import {
   SkeletonSource,
   SpatiallyIndexedSkeletonSourceBackend,
 } from "#src/skeleton/backend.js";
+import type { VertexAttributeInfo } from "#src/skeleton/base.js";
 import { decodeSkeletonChunk } from "#src/skeleton/decode_precomputed_skeleton.js";
 import { decodeCompressedSegmentationChunk } from "#src/sliceview/backend_chunk_decoders/compressed_segmentation.js";
 import { decodeCompressoChunk } from "#src/sliceview/backend_chunk_decoders/compresso.js";
@@ -88,7 +89,12 @@ import { decodeRawChunk } from "#src/sliceview/backend_chunk_decoders/raw.js";
 import type { VolumeChunk } from "#src/sliceview/volume/backend.js";
 import { VolumeChunkSource } from "#src/sliceview/volume/backend.js";
 import { decodeBrotli } from "#src/util/brotli.js";
-import { convertEndian32, Endianness } from "#src/util/endian.js";
+import { DATA_TYPE_BYTES } from "#src/util/data_type.js";
+import {
+  convertEndian16,
+  convertEndian32,
+  Endianness,
+} from "#src/util/endian.js";
 import { vec3 } from "#src/util/geom.js";
 import { maybeDecompressGzip } from "#src/util/gzip.js";
 import {
@@ -618,7 +624,10 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.slice().buffer as ArrayBuffer;
 }
 
-function decodeSpatialSkeletonFragment(buffer: ArrayBuffer) {
+function decodeSpatialSkeletonFragment(
+  buffer: ArrayBuffer,
+  vertexAttributes: Map<string, VertexAttributeInfo>,
+) {
   const dv = new DataView(buffer);
   const numVertices = dv.getUint32(0, true);
   const numEdges = dv.getUint32(4, true);
@@ -631,10 +640,32 @@ function decodeSpatialSkeletonFragment(buffer: ArrayBuffer) {
     /*indexByteOffset=*/ 8 + numVertices * 4 * 3,
     numEdges,
   );
+  // Per-vertex attributes (e.g. radius, cross_sectional_area) follow the edges,
+  // in the order declared by the info file. Returned as raw little-endian byte
+  // blocks (one per attribute) to be concatenated and uploaded as-is.
+  let offset = 8 + numVertices * 4 * 3 + numEdges * 4 * 2;
+  const attributes: Uint8Array[] = [];
+  for (const info of vertexAttributes.values()) {
+    const bytesPerVertex = DATA_TYPE_BYTES[info.dataType] * info.numComponents;
+    const totalBytes = bytesPerVertex * numVertices;
+    const attribute = new Uint8Array(buffer, offset, totalBytes);
+    switch (bytesPerVertex) {
+      case 2:
+        convertEndian16(attribute, Endianness.LITTLE);
+        break;
+      case 4:
+      case 8:
+        convertEndian32(attribute, Endianness.LITTLE);
+        break;
+    }
+    attributes.push(attribute);
+    offset += totalBytes;
+  }
   return {
     numVertices,
     vertexPositions: vertexPositions as Float32Array,
     indices: indices as Uint32Array,
+    attributes,
   };
 }
 
@@ -665,21 +696,182 @@ type SpatialSkeletonFragment = ReturnType<
   typeof decodeSpatialSkeletonFragment
 > & { id: bigint };
 
-function setEmptySpatialSkeletonChunk(chunk: SpatiallyIndexedSkeletonChunk) {
-  chunk.vertexPositions = new Float32Array(0);
-  chunk.indices = new Uint32Array(0);
-  chunk.vertexAttributes = [new BigUint64Array(0)];
+// Number of graph hops each side over which the per-vertex tangent and the
+// rendered centerline positions are smoothed.
+const TANGENT_SMOOTHING_HOPS = 3;
+
+// Moving-average of vertex positions over the +/-`TANGENT_SMOOTHING_HOPS`-hop
+// graph neighborhood, so the drawn polyline follows a smooth centerline (whose
+// local direction matches the smoothed tangent) rather than the raw zig-zag.
+function smoothFragmentPositions(
+  numVertices: number,
+  positions: Float32Array,
+  indices: Uint32Array,
+): Float32Array {
+  const adjacency: number[][] = Array.from({ length: numVertices }, () => []);
+  for (let e = 0; e < indices.length; e += 2) {
+    const a = indices[e];
+    const b = indices[e + 1];
+    adjacency[a].push(b);
+    adjacency[b].push(a);
+  }
+  const out = new Float32Array(numVertices * 3);
+  const visited = new Int32Array(numVertices).fill(-1);
+  const queue = new Int32Array(numVertices);
+  const depth = new Int32Array(numVertices);
+  for (let v = 0; v < numVertices; ++v) {
+    let sx = 0;
+    let sy = 0;
+    let sz = 0;
+    let count = 0;
+    let head = 0;
+    let tail = 0;
+    visited[v] = v;
+    depth[v] = 0;
+    queue[tail++] = v;
+    while (head < tail) {
+      const u = queue[head++];
+      sx += positions[u * 3];
+      sy += positions[u * 3 + 1];
+      sz += positions[u * 3 + 2];
+      ++count;
+      if (depth[u] < TANGENT_SMOOTHING_HOPS) {
+        for (const n of adjacency[u]) {
+          if (visited[n] !== v) {
+            visited[n] = v;
+            depth[n] = depth[u] + 1;
+            queue[tail++] = n;
+          }
+        }
+      }
+    }
+    out[v * 3] = sx / count;
+    out[v * 3 + 1] = sy / count;
+    out[v * 3 + 2] = sz / count;
+  }
+  return out;
+}
+
+// Per-vertex tangent for a fragment, used for directional coloring of edges and
+// nodes. Computed as the unit average of incident edge directions, then
+// smoothed over a +/-`TANGENT_SMOOTHING_HOPS`-vertex graph neighborhood. Sign
+// is arbitrary (consumers use abs()) — neighbor tangents are sign-aligned to the
+// center before averaging so they don't cancel. Direction-less vertices get
+// (0,0,0).
+function computeFragmentTangents(
+  numVertices: number,
+  positions: Float32Array,
+  indices: Uint32Array,
+): Float32Array {
+  // 1. Base per-vertex tangent = unit average of incident edge directions.
+  const base = new Float32Array(numVertices * 3);
+  for (let e = 0; e < indices.length; e += 2) {
+    const a = indices[e];
+    const b = indices[e + 1];
+    let dx = positions[b * 3] - positions[a * 3];
+    let dy = positions[b * 3 + 1] - positions[a * 3 + 1];
+    let dz = positions[b * 3 + 2] - positions[a * 3 + 2];
+    const len = Math.hypot(dx, dy, dz);
+    if (len > 0) {
+      dx /= len;
+      dy /= len;
+      dz /= len;
+    }
+    base[a * 3] += dx;
+    base[a * 3 + 1] += dy;
+    base[a * 3 + 2] += dz;
+    base[b * 3] += dx;
+    base[b * 3 + 1] += dy;
+    base[b * 3 + 2] += dz;
+  }
+  for (let v = 0; v < numVertices; ++v) {
+    const o = v * 3;
+    const len = Math.hypot(base[o], base[o + 1], base[o + 2]);
+    if (len > 0) {
+      base[o] /= len;
+      base[o + 1] /= len;
+      base[o + 2] /= len;
+    }
+  }
+
+  // 2. Adjacency.
+  const adjacency: number[][] = Array.from({ length: numVertices }, () => []);
+  for (let e = 0; e < indices.length; e += 2) {
+    const a = indices[e];
+    const b = indices[e + 1];
+    adjacency[a].push(b);
+    adjacency[b].push(a);
+  }
+
+  // 3. Smooth: average base tangents over the graph neighborhood within
+  // `TANGENT_SMOOTHING_HOPS` hops (BFS), sign-aligned to the center vertex.
+  const out = new Float32Array(numVertices * 3);
+  // `visited` uses the center vertex index as a per-BFS generation marker to
+  // avoid reallocating; `queue`/`depth` are scratch reused across vertices.
+  const visited = new Int32Array(numVertices).fill(-1);
+  const queue = new Int32Array(numVertices);
+  const depth = new Int32Array(numVertices);
+  for (let v = 0; v < numVertices; ++v) {
+    const cx = base[v * 3];
+    const cy = base[v * 3 + 1];
+    const cz = base[v * 3 + 2];
+    let sx = 0;
+    let sy = 0;
+    let sz = 0;
+    let head = 0;
+    let tail = 0;
+    visited[v] = v;
+    depth[v] = 0;
+    queue[tail++] = v;
+    while (head < tail) {
+      const u = queue[head++];
+      const ux = base[u * 3];
+      const uy = base[u * 3 + 1];
+      const uz = base[u * 3 + 2];
+      const sign = ux * cx + uy * cy + uz * cz >= 0 ? 1 : -1;
+      sx += sign * ux;
+      sy += sign * uy;
+      sz += sign * uz;
+      if (depth[u] < TANGENT_SMOOTHING_HOPS) {
+        for (const n of adjacency[u]) {
+          if (visited[n] !== v) {
+            visited[n] = v;
+            depth[n] = depth[u] + 1;
+            queue[tail++] = n;
+          }
+        }
+      }
+    }
+    const len = Math.hypot(sx, sy, sz);
+    if (len > 0) {
+      out[v * 3] = sx / len;
+      out[v * 3 + 1] = sy / len;
+      out[v * 3 + 2] = sz / len;
+    }
+  }
+  return out;
 }
 
 // Concatenates decoded fragments into a single chunk geometry: positions are
 // shifted into the gridOrigin-relative nm frame the chunk grid uses, edges are
-// re-based by the running vertex count, and the per-vertex segment-id (uint64)
-// attribute is filled with each fragment's label.
+// re-based by the running vertex count, the per-vertex segment-id (uint64)
+// attribute is filled with each fragment's label, a synthesized per-vertex
+// `tangent` (vec3) is computed for directional coloring, and the per-vertex
+// info attributes (e.g. radius, cross_sectional_area) are concatenated as raw
+// bytes. The resulting `vertexAttributes` order
+// (`[segment, tangent, ...infoAttributes]`) matches the frontend source's
+// declared `vertexAttributes` (minus the implicit position at slot 0).
 function packSpatialSkeletonFragments(
   chunk: SpatiallyIndexedSkeletonChunk,
   fragments: ReadonlyArray<SpatialSkeletonFragment | undefined>,
+  vertexAttributes: Map<string, VertexAttributeInfo>,
   gridOrigin: Float32Array,
 ) {
+  const attributeBytesPerVertex = Array.from(
+    vertexAttributes.values(),
+    (info) => DATA_TYPE_BYTES[info.dataType] * info.numComponents,
+  );
+
   let totalVertices = 0;
   let totalIndices = 0;
   for (const fragment of fragments) {
@@ -690,12 +882,30 @@ function packSpatialSkeletonFragments(
 
   const vertexPositions = new Float32Array(totalVertices * 3);
   const segmentIdAttribute = new BigUint64Array(totalVertices);
+  const tangentAttribute = new Float32Array(totalVertices * 3);
   const indices = new Uint32Array(totalIndices);
+  const infoAttributes = attributeBytesPerVertex.map(
+    (bytesPerVertex) => new Uint8Array(bytesPerVertex * totalVertices),
+  );
   let vertexOffset = 0;
   let indexOffset = 0;
   for (const fragment of fragments) {
     if (fragment === undefined) continue;
-    const { numVertices, vertexPositions: fragPositions } = fragment;
+    const { numVertices, vertexPositions: rawPositions } = fragment;
+    // Smooth the centerline so the drawn lines follow the smoothed direction,
+    // and derive the tangent from the same smoothed path so color and geometry
+    // are consistent.
+    const fragPositions = smoothFragmentPositions(
+      numVertices,
+      rawPositions,
+      fragment.indices,
+    );
+    const fragTangents = computeFragmentTangents(
+      numVertices,
+      fragPositions,
+      fragment.indices,
+    );
+    tangentAttribute.set(fragTangents, vertexOffset * 3);
     for (let v = 0; v < numVertices; ++v) {
       const src = v * 3;
       const dst = (vertexOffset + v) * 3;
@@ -703,6 +913,13 @@ function packSpatialSkeletonFragments(
       vertexPositions[dst + 1] = fragPositions[src + 1] - gridOrigin[1];
       vertexPositions[dst + 2] = fragPositions[src + 2] - gridOrigin[2];
       segmentIdAttribute[vertexOffset + v] = fragment.id;
+    }
+    for (let a = 0; a < infoAttributes.length; ++a) {
+      const bytesPerVertex = attributeBytesPerVertex[a];
+      infoAttributes[a].set(
+        fragment.attributes[a],
+        vertexOffset * bytesPerVertex,
+      );
     }
     const { indices: fragIndices } = fragment;
     for (let e = 0; e < fragIndices.length; ++e) {
@@ -714,7 +931,11 @@ function packSpatialSkeletonFragments(
 
   chunk.vertexPositions = vertexPositions;
   chunk.indices = indices;
-  chunk.vertexAttributes = [segmentIdAttribute];
+  chunk.vertexAttributes = [
+    segmentIdAttribute,
+    tangentAttribute,
+    ...infoAttributes,
+  ];
 }
 
 // Decompresses one MapBuffer blob according to the file's declared compression.
@@ -754,7 +975,7 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
   private fragsUnavailable = false;
 
   async download(chunk: SpatiallyIndexedSkeletonChunk, signal: AbortSignal) {
-    const { gridOrigin } = this.parameters;
+    const { metadata, gridOrigin } = this.parameters;
     const { chunkGridPosition } = chunk;
 
     // Primary path: the per-chunk `.frags` MapBuffer (one request for every
@@ -762,7 +983,12 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
     if (!this.fragsUnavailable) {
       const fragments = await this.downloadFrags(chunkGridPosition, signal);
       if (fragments !== undefined) {
-        packSpatialSkeletonFragments(chunk, fragments, gridOrigin);
+        packSpatialSkeletonFragments(
+          chunk,
+          fragments,
+          metadata.vertexAttributes,
+          gridOrigin,
+        );
         return;
       }
     }
@@ -810,7 +1036,10 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
       );
       fragments.push({
         id: entry.label,
-        ...decodeSpatialSkeletonFragment(toArrayBuffer(skeletonBytes)),
+        ...decodeSpatialSkeletonFragment(
+          toArrayBuffer(skeletonBytes),
+          metadata.vertexAttributes,
+        ),
       });
     }
     return fragments;
@@ -844,7 +1073,12 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
     );
     if (indexResponse === undefined) {
       // Neither `.frags` nor `.spatial` for this chunk: empty.
-      setEmptySpatialSkeletonChunk(chunk);
+      packSpatialSkeletonFragments(
+        chunk,
+        [],
+        metadata.vertexAttributes,
+        gridOrigin,
+      );
       return;
     }
     // `.spatial` exists but `.frags` did not: this source uses the sharded
@@ -857,7 +1091,12 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
     const indexJson = JSON.parse(new TextDecoder().decode(indexBytes));
     const segmentIds = Object.keys(indexJson).map((k) => BigInt(k));
     if (segmentIds.length === 0) {
-      setEmptySpatialSkeletonChunk(chunk);
+      packSpatialSkeletonFragments(
+        chunk,
+        [],
+        metadata.vertexAttributes,
+        gridOrigin,
+      );
       return;
     }
 
@@ -868,7 +1107,13 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
       fragments = segmentIds.map((id) => {
         const bytes = dataMap.get(id);
         if (bytes === undefined) return undefined;
-        return { id, ...decodeSpatialSkeletonFragment(toArrayBuffer(bytes)) };
+        return {
+          id,
+          ...decodeSpatialSkeletonFragment(
+            toArrayBuffer(bytes),
+            metadata.vertexAttributes,
+          ),
+        };
       });
     } else {
       fragments = await mapWithConcurrency(segmentIds, 16, async (id) => {
@@ -878,12 +1123,18 @@ export class PrecomputedSpatialSkeletonSourceBackend extends WithParameters(
           id,
           ...decodeSpatialSkeletonFragment(
             await response.response.arrayBuffer(),
+            metadata.vertexAttributes,
           ),
         };
       });
     }
 
-    packSpatialSkeletonFragments(chunk, fragments, gridOrigin);
+    packSpatialSkeletonFragments(
+      chunk,
+      fragments,
+      metadata.vertexAttributes,
+      gridOrigin,
+    );
   }
 }
 
