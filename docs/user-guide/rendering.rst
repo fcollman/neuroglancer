@@ -18,8 +18,12 @@ SSAO simulates shadows on 3-D mesh surfaces by darkening crevices and
 concavities where ambient light would be occluded. It adds depth cues that help
 you perceive shapes, and makes the display more appealing.
 
-.. TODO: Add before/after screenshots once docs images are hosted outside the
-   repo (bucket or git LFS).
+.. raw:: html
+
+   <p align="center">
+     <img src="https://storage.googleapis.com/neuroglancer-doc-videos/0/user-guide/ssao/ssao-off.png" width="45%" alt="Mesh rendering without SSAO" />
+     <img src="https://storage.googleapis.com/neuroglancer-doc-videos/0/user-guide/ssao/ssao-on.png" width="45%" alt="Mesh rendering with SSAO" />
+   </p>
 
 Use the :kbd:`q` key to toggle SSAO on and off. The settings panel has three
 controls for SSAO:
