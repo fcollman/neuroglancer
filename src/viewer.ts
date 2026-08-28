@@ -122,6 +122,7 @@ import {
   verifyFinitePositiveFloat,
   verifyNonnegativeInt,
   verifyObject,
+  verifyOptionalBoolean,
   verifyOptionalObjectProperty,
   verifyString,
 } from "#src/util/json.js";
@@ -250,6 +251,40 @@ const defaultViewerOptions =
         resetStateWhenEmpty: true,
       };
 
+/**
+ * User overrides for the visibility of individual UI controls, persisted in the
+ * viewer state under the `uiControlVisibility` key.
+ *
+ * Each member is tri-state: `undefined` means "follow the embedder's
+ * `ViewerUIConfiguration` value", and `true`/`false` is an explicit user
+ * choice. The embedder's configuration still wins when it hides a control, so
+ * an override may hide a control the configuration permits but can never
+ * reveal one the configuration disallows.
+ *
+ * Additional `VIEWER_UI_CONTROL_CONFIG_OPTIONS` members belong here as they
+ * become user-toggleable, rather than as new top level state keys.
+ */
+class TrackableUiControlVisibility extends CompoundTrackable {
+  showLayerPanel = new TrackableValue<boolean | undefined>(
+    undefined,
+    verifyOptionalBoolean,
+  );
+
+  constructor() {
+    super();
+    this.add("showLayerPanel", this.showLayerPanel);
+  }
+
+  toJSON(): any {
+    const result = super.toJSON();
+    for (const key in result) {
+      if (result[key] !== undefined) return result;
+    }
+    // Omit the section rather than emitting an empty object in every state.
+    return undefined;
+  }
+}
+
 class TrackableViewerState extends CompoundTrackable {
   constructor(public viewer: Borrowed<Viewer>) {
     super();
@@ -306,12 +341,7 @@ class TrackableViewerState extends CompoundTrackable {
     this.add("selectedStateServer", viewer.selectedStateServer);
     this.add("toolBindings", viewer.toolBinder);
     this.add("toolPalettes", viewer.toolPalettes);
-    this.add("hideLayerPanel", viewer.hideLayerPanelState);
-
-    // Add UI configuration to state for persistence
-    // for (const key of VIEWER_UI_CONFIG_OPTIONS) {
-    //   this.add(key, viewer.uiConfiguration[key]);
-    // }
+    this.add("uiControlVisibility", viewer.uiControlVisibilityState);
   }
 
   restoreState(obj: any) {
@@ -462,7 +492,9 @@ export class Viewer extends RefCounted implements ViewerState {
   partialViewport = new TrackableWindowedViewport();
   statisticsDisplayState = new StatisticsDisplayState();
   helpPanelState = new HelpPanelState();
-  hideLayerPanelState = new TrackableBoolean(false, false);
+  uiControlVisibilityState = this.registerDisposer(
+    new TrackableUiControlVisibility(),
+  );
   settingsPanelState = new ViewerSettingsPanelState();
   layerSelectedValues = this.registerDisposer(
     new LayerSelectedValues(this.layerManager, this.mouseState),
@@ -501,7 +533,13 @@ export class Viewer extends RefCounted implements ViewerState {
   dataSourceProvider: Borrowed<DataSourceRegistry>;
 
   uiConfiguration: ViewerUIConfiguration;
+  /** Effective layer panel visibility: the configuration and the user override combined. */
   effectiveShowLayerPanel: WatchableValueInterface<boolean>;
+  /**
+   * Reads `effectiveShowLayerPanel` and writes the user override, for the
+   * toggle in the layer list panel.
+   */
+  layerPanelVisibility: WatchableValueInterface<boolean>;
 
   private makeUiControlVisibilityState(
     key: (typeof VIEWER_UI_CONTROL_CONFIG_OPTIONS)[number],
@@ -584,17 +622,27 @@ export class Viewer extends RefCounted implements ViewerState {
     this.dataSourceProvider = dataSourceProvider;
     this.uiConfiguration = uiConfiguration;
 
-    // Create effective showLayerPanel state that combines configuration and user preference
+    // The configuration is the embedder's policy and always wins when it hides
+    // the panel; the override is the user's choice within what it permits.
     this.effectiveShowLayerPanel = this.registerDisposer(
       makeDerivedWatchableValue(
-        (configEnabled: boolean, hideState: boolean) => {
-          // Layer panel is shown when config allows it AND hide state is false
-          return configEnabled && !hideState;
-        },
+        (configEnabled: boolean, override: boolean | undefined) =>
+          configEnabled && (override ?? true),
         this.uiConfiguration.showLayerPanel,
-        this.hideLayerPanelState,
+        this.uiControlVisibilityState.showLayerPanel,
       ),
     );
+    const { effectiveShowLayerPanel } = this;
+    const showLayerPanelOverride = this.uiControlVisibilityState.showLayerPanel;
+    this.layerPanelVisibility = {
+      get value() {
+        return effectiveShowLayerPanel.value;
+      },
+      set value(newValue: boolean) {
+        showLayerPanelOverride.value = newValue;
+      },
+      changed: effectiveShowLayerPanel.changed,
+    };
 
     this.registerDisposer(
       observeWatchable((value) => {
@@ -1008,7 +1056,7 @@ export class Viewer extends RefCounted implements ViewerState {
             this.sidePanelManager,
             this.layerSpecification,
             this.layerListPanelState,
-            this.hideLayerPanelState,
+            this.layerPanelVisibility,
             this.uiConfiguration.showLayerPanel,
           ),
       }),
