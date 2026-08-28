@@ -24,7 +24,6 @@ import type {
   TopLevelLayerListSpecification,
 } from "#src/layer/index.js";
 import { deleteLayer } from "#src/layer/index.js";
-import type { TrackableBoolean } from "#src/trackable_boolean.js";
 import { TrackableBooleanCheckbox } from "#src/trackable_boolean.js";
 import type { WatchableValueInterface } from "#src/trackable_value.js";
 import type { DropLayers } from "#src/ui/layer_drag_and_drop.js";
@@ -341,7 +340,7 @@ export class LayerListPanel extends SidePanel {
     public manager: TopLevelLayerListSpecification,
     public state: LayerListPanelState,
     public layerPanelVisibility: WatchableValueInterface<boolean>,
-    public showLayerPanel?: TrackableBoolean,
+    public showLayerPanel?: WatchableValueInterface<boolean>,
   ) {
     super(sidePanelManager, state.location);
     const { itemContainer, layerDropZone } = this;

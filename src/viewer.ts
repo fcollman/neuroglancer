@@ -622,28 +622,6 @@ export class Viewer extends RefCounted implements ViewerState {
     this.dataSourceProvider = dataSourceProvider;
     this.uiConfiguration = uiConfiguration;
 
-    // The configuration is the embedder's policy and always wins when it hides
-    // the panel; the override is the user's choice within what it permits.
-    this.effectiveShowLayerPanel = this.registerDisposer(
-      makeDerivedWatchableValue(
-        (configEnabled: boolean, override: boolean | undefined) =>
-          configEnabled && (override ?? true),
-        this.uiConfiguration.showLayerPanel,
-        this.uiControlVisibilityState.showLayerPanel,
-      ),
-    );
-    const { effectiveShowLayerPanel } = this;
-    const showLayerPanelOverride = this.uiControlVisibilityState.showLayerPanel;
-    this.layerPanelVisibility = {
-      get value() {
-        return effectiveShowLayerPanel.value;
-      },
-      set value(newValue: boolean) {
-        showLayerPanelOverride.value = newValue;
-      },
-      changed: effectiveShowLayerPanel.changed,
-    };
-
     this.registerDisposer(
       observeWatchable((value) => {
         this.display.applyWindowedViewportToElement(element, value);
@@ -662,6 +640,31 @@ export class Viewer extends RefCounted implements ViewerState {
     for (const key of VIEWER_UI_CONTROL_CONFIG_OPTIONS) {
       this.uiControlVisibility[key] = this.makeUiControlVisibilityState(key);
     }
+
+    // Layer the user override on top of `uiControlVisibility.showLayerPanel`,
+    // not on `uiConfiguration.showLayerPanel`: the former also accounts for
+    // `showUIControls`, which `Viewer.screenshot` turns off to capture the data
+    // panels alone. The override may hide the panel within what the
+    // configuration permits, but can never reveal one it disallows.
+    this.effectiveShowLayerPanel = this.registerDisposer(
+      makeDerivedWatchableValue(
+        (configEnabled: boolean, override: boolean | undefined) =>
+          configEnabled && (override ?? true),
+        this.uiControlVisibility.showLayerPanel,
+        this.uiControlVisibilityState.showLayerPanel,
+      ),
+    );
+    const { effectiveShowLayerPanel } = this;
+    const showLayerPanelOverride = this.uiControlVisibilityState.showLayerPanel;
+    this.layerPanelVisibility = {
+      get value() {
+        return effectiveShowLayerPanel.value;
+      },
+      set value(newValue: boolean) {
+        showLayerPanelOverride.value = newValue;
+      },
+      changed: effectiveShowLayerPanel.changed,
+    };
     this.registerDisposer(
       this.uiConfiguration.showPanelBorders.changed.add(() => {
         this.updateShowBorders();
@@ -1057,7 +1060,7 @@ export class Viewer extends RefCounted implements ViewerState {
             this.layerSpecification,
             this.layerListPanelState,
             this.layerPanelVisibility,
-            this.uiConfiguration.showLayerPanel,
+            this.uiControlVisibility.showLayerPanel,
           ),
       }),
     );
