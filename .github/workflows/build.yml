@@ -113,6 +113,10 @@ jobs:
           cache: "npm"
           cache-dependency-path: |
             package-lock.json
+      # uv is invoked by neuroglancer's `prepare` script (via build-package
+      # -> generate_colormaps_zarr.py) when example projects install
+      # neuroglancer from `file:../../..`.
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
       - run: npm ci
       - run: npm run example-project-test -- --reporter=html
       - name: Upload report and built clients
@@ -154,7 +158,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - uses: ./.github/actions/setup-firefox
       - name: Setup tmate session
-        uses: mxschmitt/action-tmate@c0afd6f790e3a5564914980036ebf83216678101 # v3.23
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled }}
       - run: uvx nox -s lint format mypy
       - name: Check for dirty working directory
@@ -220,6 +224,12 @@ jobs:
           CIBW_ENVIRONMENT_LINUX: UV_CACHE_DIR=/host${{ steps.uv-cache.outputs.dir }}
           CIBW_BEFORE_ALL_LINUX: /project/python/build_tools/cibuildwheel_linux_cache_setup.sh /host${{ steps.uv-cache.outputs.dir }}
           CIBW_BUILD: ${{ matrix.cibw_build }}
+          # cryptography>=49 dropped macOS x86_64 wheels (48.x shipped universal2),
+          # forcing a source build that can't cross-compile openssl on the arm64
+          # runner. CIBW_TEST_ENVIRONMENT_MACOS injects UV_CONSTRAINT into the
+          # cibuildwheel test subprocess (where uv pip install resolves deps),
+          # capping the transitive cryptography version for x86_64 test installs only.
+          CIBW_TEST_ENVIRONMENT_MACOS: ${{ matrix.wheel_identifier == 'macos_x86_64' && format('UV_CONSTRAINT={0}/python/build_tools/macos-x86_64-test-constraints.txt', github.workspace) || '' }}
       - name: Upload wheels as artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -291,6 +301,9 @@ jobs:
       - "docs"
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24.18.0"
       - uses: actions/download-artifact@v8
         with:
           name: client
@@ -300,7 +313,7 @@ jobs:
           name: python-client-static
           path: python/neuroglancer/static/client
       - name: Publish client to Firebase hosting
-        uses: FirebaseExtended/action-hosting-deploy@e2eda2e106cfa35cdbcf4ac9ddaf6c4756df2c8c # v0.10.0
+        uses: FirebaseExtended/action-hosting-deploy@500ac625ca2dd40cbd15f7659af953801858032a # v0.11.0
         with:
           firebaseServiceAccount: "${{ secrets.FIREBASE_HOSTING_SERVICE_ACCOUNT_KEY }}"
           projectId: neuroglancer-demo
@@ -311,7 +324,7 @@ jobs:
           name: docs
           path: dist/docs
       - name: Publish docs to Firebase hosting
-        uses: FirebaseExtended/action-hosting-deploy@e2eda2e106cfa35cdbcf4ac9ddaf6c4756df2c8c # v0.10.0
+        uses: FirebaseExtended/action-hosting-deploy@500ac625ca2dd40cbd15f7659af953801858032a # v0.11.0
         with:
           firebaseServiceAccount: "${{ secrets.FIREBASE_HOSTING_SERVICE_ACCOUNT_KEY }}"
           projectId: neuroglancer-demo

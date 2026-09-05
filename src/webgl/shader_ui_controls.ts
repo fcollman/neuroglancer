@@ -25,6 +25,7 @@ import {
   makeCachedDerivedWatchableValue,
   makeCachedLazyDerivedWatchableValue,
   TrackableValue,
+  WatchableValue,
 } from "#src/trackable_value.js";
 import { arraysEqual, arraysEqualWithPredicate } from "#src/util/array.js";
 import {
@@ -40,6 +41,7 @@ import {
   parseFixedLengthArray,
   verifyFiniteFloat,
   verifyInt,
+  verifyNonnegativeInt,
   verifyObject,
   verifyOptionalObjectProperty,
   verifyString,
@@ -57,6 +59,8 @@ import {
 } from "#src/util/lerp.js";
 import { NullarySignal } from "#src/util/signal.js";
 import type { Trackable } from "#src/util/trackable.js";
+import type { ColormapName } from "#src/webgl/colormaps.js";
+import { COLORMAP_NAMES, colormapDataLoaded } from "#src/webgl/colormaps.js";
 import type { GL } from "#src/webgl/context.js";
 import type { HistogramChannelSpecification } from "#src/webgl/empirical_cdf.js";
 import { HistogramSpecifications } from "#src/webgl/empirical_cdf.js";
@@ -64,7 +68,19 @@ import {
   defineInvlerpShaderFunction,
   enableLerpShaderFunction,
 } from "#src/webgl/lerp.js";
-import type { ShaderBuilder, ShaderProgram } from "#src/webgl/shader.js";
+import type {
+  CompatColormap,
+  ShaderBuilder,
+  ShaderProgram,
+} from "#src/webgl/shader.js";
+import {
+  activeControlsEqual,
+  computeActiveControls,
+} from "#src/webgl/shader_control_reachability.js";
+import {
+  preprocessStrings,
+  type ShaderStringLiteralIdMap,
+} from "#src/webgl/shader_source_string_preprocessing.js";
 import type { TransferFunctionParameters } from "#src/widget/transfer_function.js";
 import {
   defineTransferFunctionShader,
@@ -111,10 +127,35 @@ export interface ShaderCheckboxControl {
   default: boolean;
 }
 
+export type ShaderSelectValueType = "string_t" | "int" | "uint" | "float";
+
+export type ShaderSelectValue = string | number;
+
+export interface ShaderSelectOption {
+  value: ShaderSelectValue;
+  label?: string;
+}
+
+export interface ShaderSelectControl {
+  type: "select";
+  valueType: ShaderSelectValueType;
+  options: ShaderSelectOption[];
+  default: ShaderSelectValue;
+}
+
 export interface ShaderTransferFunctionControl {
   type: "transferFunction";
   dataType: DataType;
   default: TransferFunctionParameters;
+}
+
+export interface ColormapParameters {
+  colormap: ColormapName;
+}
+
+export interface ShaderColormapControl {
+  type: "colormap";
+  default: ColormapParameters;
 }
 
 export type ShaderUiControl =
@@ -123,7 +164,9 @@ export type ShaderUiControl =
   | ShaderImageInvlerpControl
   | ShaderPropertyInvlerpControl
   | ShaderCheckboxControl
-  | ShaderTransferFunctionControl;
+  | ShaderSelectControl
+  | ShaderTransferFunctionControl
+  | ShaderColormapControl;
 
 export interface ShaderControlParseError {
   line: number;
@@ -135,8 +178,25 @@ export interface ShaderControlsParseResult {
   source: string;
   // Source code with comments stripped and UI controls replaced by appropriate text.
   code: string;
-  controls: Map<string, ShaderUiControl>;
+  controls: Controls;
+  preprocessing: { stringLiteralIds: ShaderStringLiteralIdMap };
   errors: ShaderControlParseError[];
+}
+
+/** Free GLSL colormap functions kept for backwards compatibility. */
+const COMPAT_COLORMAPS: readonly CompatColormap[] = [
+  { funcName: "colormapJet", name: "jet" },
+  { funcName: "colormapCubehelix", name: "cubehelix" },
+];
+
+function detectCompatColormaps(source: string): CompatColormap[] {
+  const found: CompatColormap[] = [];
+  for (const entry of COMPAT_COLORMAPS) {
+    if (new RegExp(`\\b${entry.funcName}\\b`).test(source)) {
+      found.push(entry);
+    }
+  }
+  return found;
 }
 
 export interface ShaderControlsBuilderState {
@@ -371,6 +431,167 @@ function parseCheckboxDirective(
       valueType,
       default: defaultValue,
     } as ShaderCheckboxControl,
+    errors: undefined,
+  };
+}
+
+function isShaderSelectValueType(
+  valueType: string,
+): valueType is ShaderSelectValueType {
+  return (
+    valueType === "string_t" ||
+    valueType === "int" ||
+    valueType === "uint" ||
+    valueType === "float"
+  );
+}
+
+function verifyShaderSelectValue(
+  valueType: ShaderSelectValueType,
+  value: unknown,
+): ShaderSelectValue {
+  switch (valueType) {
+    case "string_t":
+      return verifyString(value);
+    case "int":
+      return verifyInt(value);
+    case "uint":
+      return verifyNonnegativeInt(value);
+    case "float":
+      return verifyFiniteFloat(value);
+  }
+}
+
+function parseSelectOptions(
+  valueType: ShaderSelectValueType,
+  value: unknown,
+): {
+  options: ShaderSelectOption[] | undefined;
+  errors: string[];
+} {
+  const parseOption = (optionValue: unknown, label?: string) => {
+    try {
+      return { value: verifyShaderSelectValue(valueType, optionValue), label };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : `${error}`;
+      throw new Error(
+        label === undefined
+          ? `Invalid option value: ${message}`
+          : `Invalid option value for ${JSON.stringify(label)}: ${message}`,
+      );
+    }
+  };
+
+  try {
+    let options: ShaderSelectOption[];
+    if (Array.isArray(value)) {
+      options = value.map((optionValue) => parseOption(optionValue));
+    } else if (typeof value === "object" && value !== null) {
+      options = Object.entries(verifyObject(value)).map(
+        ([label, optionValue]) => parseOption(optionValue, label),
+      );
+    } else {
+      return {
+        options: undefined,
+        errors: [
+          `Expected options argument to be an array of ${valueType} values or an object mapping labels to ${valueType} values`,
+        ],
+      };
+    }
+    if (options.length === 0) {
+      return {
+        options: undefined,
+        errors: ["Expected options argument to contain at least one option"],
+      };
+    }
+    const seenValues = new Set<ShaderSelectValue>();
+    for (const option of options) {
+      if (seenValues.has(option.value)) {
+        return {
+          options: undefined,
+          errors: [`Duplicate option value: ${JSON.stringify(option.value)}`],
+        };
+      }
+      seenValues.add(option.value);
+    }
+    return { options, errors: [] };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : `${error}`;
+    return {
+      options: undefined,
+      errors: [message],
+    };
+  }
+}
+
+function formatShaderSelectValue(value: ShaderSelectValue) {
+  return typeof value === "string" ? value : `${value}`;
+}
+
+export function getShaderSelectOptionLabel(option: ShaderSelectOption) {
+  const valueText = formatShaderSelectValue(option.value);
+  if (option.label === undefined || option.label === valueText) {
+    return valueText;
+  }
+  return `${option.label} (${valueText})`;
+}
+
+function parseSelectDirective(
+  valueType: string,
+  parameters: DirectiveParameters,
+): DirectiveParseResult {
+  const errors: string[] = [];
+  if (!isShaderSelectValueType(valueType)) {
+    errors.push("type must be one of string_t, int, uint, or float");
+  }
+  let options: ShaderSelectOption[] | undefined;
+  let defaultValue: ShaderSelectValue | undefined;
+  for (const [key, value] of parameters) {
+    if (key === "options") {
+      if (isShaderSelectValueType(valueType)) {
+        const result = parseSelectOptions(valueType, value);
+        errors.push(...result.errors);
+        options = result.options;
+      }
+    } else if (key === "default") {
+      if (isShaderSelectValueType(valueType)) {
+        try {
+          defaultValue = verifyShaderSelectValue(valueType, value);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : `${error}`;
+          errors.push(`Invalid default value: ${message}`);
+        }
+      }
+    } else {
+      errors.push(`Invalid parameter: ${key}`);
+    }
+  }
+  if (!parameters.has("options")) {
+    errors.push("options must be specified");
+  }
+  if (options === undefined) {
+    return { errors };
+  }
+  let resolvedDefaultValue = options[0].value;
+  if (defaultValue !== undefined) {
+    if (!options.some((option) => option.value === defaultValue)) {
+      errors.push(
+        `default value ${JSON.stringify(defaultValue)} must match one of the options`,
+      );
+    } else {
+      resolvedDefaultValue = defaultValue;
+    }
+  }
+  if (errors.length > 0) {
+    return { errors };
+  }
+  return {
+    control: {
+      type: "select",
+      valueType,
+      options,
+      default: resolvedDefaultValue,
+    } as ShaderSelectControl,
     errors: undefined,
   };
 }
@@ -674,6 +895,50 @@ export interface ShaderDataContext {
   properties?: Map<string, DataType>;
 }
 
+function parseColormapDirective(
+  valueType: string,
+  parameters: DirectiveParameters,
+  _dataContext: ShaderDataContext,
+): DirectiveParseResult {
+  const errors: string[] = [];
+  if (valueType !== "colormap") {
+    errors.push("type must be colormap");
+  }
+  let colormapName: ColormapName = "grayscale";
+  for (const [key, value] of parameters) {
+    try {
+      switch (key) {
+        case "default": {
+          const s = verifyString(value);
+          if (!(COLORMAP_NAMES as readonly string[]).includes(s)) {
+            errors.push(
+              `Invalid colormap name ${JSON.stringify(s)}. Valid names: ${COLORMAP_NAMES.join(", ")}`,
+            );
+          } else {
+            colormapName = s as ColormapName;
+          }
+          break;
+        }
+        default:
+          errors.push(`Invalid parameter: ${key}`);
+          break;
+      }
+    } catch (e) {
+      errors.push(`Invalid ${key} value: ${e.message}`);
+    }
+  }
+  if (errors.length > 0) {
+    return { errors };
+  }
+  return {
+    control: {
+      type: "colormap",
+      default: { colormap: colormapName },
+    } as ShaderColormapControl,
+    errors: undefined,
+  };
+}
+
 const controlParsers = new Map<
   string,
   (
@@ -686,7 +951,9 @@ const controlParsers = new Map<
   ["color", parseColorDirective],
   ["invlerp", parseInvlerpDirective],
   ["checkbox", parseCheckboxDirective],
+  ["select", parseSelectDirective],
   ["transferFunction", parseTransferFunctionDirective],
+  ["colormap", parseColormapDirective],
 ]);
 
 export function parseShaderUiControls(
@@ -752,7 +1019,14 @@ export function parseShaderUiControls(
       return "";
     },
   );
-  return { source: code, code: newCode, errors, controls };
+  const preprocessed = preprocessStrings(newCode);
+  return {
+    source: code,
+    code: preprocessed.code,
+    controls,
+    preprocessing: { stringLiteralIds: preprocessed.stringLiteralIds },
+    errors,
+  };
 }
 
 export type Controls = Map<string, ShaderUiControl>;
@@ -821,6 +1095,37 @@ float ${uName}() {
         );
         break;
       }
+      case "select": {
+        let code: string;
+        if (control.valueType === "string_t") {
+          builder.addUniform("highp uint", uName);
+          code = `#define ${name} string_t(${uName})\n`;
+        } else {
+          builder.addUniform(`highp ${control.valueType}`, uName);
+          code = `#define ${name} ${uName}\n`;
+        }
+        builder.addVertexCode(code);
+        builder.addFragmentCode(code);
+        break;
+      }
+      case "colormap": {
+        // Sample the colormap as a 256x1 RGB texture. The texture is bound
+        // per-draw (see setControlInShader); switching the selected colormap
+        // re-uploads the texture rather than recompiling the shader.
+        const samplerName = `${uName}_sampler`;
+        builder.addTextureSampler("sampler2D", samplerName, name);
+        const rgbaName = `${uName}RGBA`;
+        const wrapper = [
+          `vec3 ${uName}(float t) { return texture(${samplerName}, vec2(clamp(t, 0.0, 1.0), 0.5)).rgb; }\n`,
+          `vec4 ${rgbaName}(float t) { return vec4(${uName}(t), t); }\n`,
+        ].join("");
+        const define = `#define ${name} ${uName}\n#define ${name}RGBA ${rgbaName}\n`;
+        builder.addFragmentCode(wrapper);
+        builder.addFragmentCode(define);
+        builder.addVertexCode(wrapper);
+        builder.addVertexCode(define);
+        break;
+      }
       default: {
         builder.addUniform(`highp ${control.valueType}`, uName);
         builder.addVertexCode(`#define ${name} ${uName}\n`);
@@ -829,6 +1134,33 @@ float ${uName}() {
       }
     }
   }
+  // Back-compat: free GLSL functions like `colormapJet` / `colormapCubehelix`
+  // referenced directly by the user's shader are wired through the same
+  // sampler-based path. The texture is bound per-draw in setControlsInShader,
+  // which reads the list off `shader.compatColormaps`.
+  const compatColormaps = detectCompatColormaps(builderState.parseResult.code);
+  for (const { funcName } of compatColormaps) {
+    const samplerName = `${funcName}_sampler`;
+    const sym = compatColormapSamplerSymbol(funcName);
+    builder.addTextureSampler("sampler2D", samplerName, sym);
+    const wrapper = `vec3 ${funcName}(float t) { return texture(${samplerName}, vec2(clamp(t, 0.0, 1.0), 0.5)).rgb; }\n`;
+    builder.addFragmentCode(wrapper);
+    builder.addVertexCode(wrapper);
+  }
+  if (compatColormaps.length > 0) {
+    builder.addInitializer((shader) => {
+      shader.compatColormaps = compatColormaps;
+    });
+  }
+}
+
+/**
+ * Symbol used to allocate the texture unit + bind the texture for the back-
+ * compat free function named `funcName` (e.g. `colormapJet`). Stable across
+ * build + draw time so the bound unit and uploaded texture line up.
+ */
+function compatColormapSamplerSymbol(funcName: string): string {
+  return `_neuroglancer_compatColormap_${funcName}`;
 }
 
 function replaceBigintAndMap(_key: string, value: unknown) {
@@ -842,8 +1174,10 @@ function replaceBigintAndMap(_key: string, value: unknown) {
 }
 
 function encodeControls(controls: Controls | undefined) {
-  if (controls === undefined) return undefined;
-  return JSON.stringify(Object.fromEntries(controls), replaceBigintAndMap);
+  return JSON.stringify(
+    Object.fromEntries(controls ?? []),
+    replaceBigintAndMap,
+  );
 }
 
 export class WatchableShaderUiControls
@@ -949,6 +1283,46 @@ class TrackableImageInvlerpParameters extends TrackableValue<ImageInvlerpParamet
   }
 }
 
+function parseColormapName(x: unknown): ColormapName {
+  const s = verifyString(x);
+  if (!(COLORMAP_NAMES as readonly string[]).includes(s)) {
+    throw new Error(`Invalid colormap name: ${JSON.stringify(s)}`);
+  }
+  return s as ColormapName;
+}
+
+function parseColormapParameters(
+  obj: unknown,
+  defaultValue: ColormapParameters,
+): ColormapParameters {
+  if (obj === undefined) return defaultValue;
+  // Accept either a bare string (e.g. "viridis") or an object {colormap: "..."}.
+  if (typeof obj === "string") {
+    return { colormap: parseColormapName(obj) };
+  }
+  verifyObject(obj);
+  return {
+    colormap: verifyOptionalObjectProperty(
+      obj,
+      "colormap",
+      parseColormapName,
+      defaultValue.colormap,
+    ),
+  };
+}
+
+class TrackableColormapParameters extends TrackableValue<ColormapParameters> {
+  constructor(public defaultValue: ColormapParameters) {
+    super(defaultValue, (obj) => parseColormapParameters(obj, defaultValue));
+  }
+
+  toJSON() {
+    const { colormap } = this.value;
+    if (colormap === this.defaultValue.colormap) return undefined;
+    return colormap;
+  }
+}
+
 function parsePropertyInvlerpParameters(
   obj: unknown,
   properties: PropertiesSpecification,
@@ -1031,7 +1405,6 @@ function parseTransferFunctionControlPoints(
   dataType: DataType,
 ) {
   const parsedPoints = parseArray(controlPointsDefinition, (x) => {
-    // Validate input length and types
     const allowedInput =
       dataType === DataType.UINT64
         ? typeof x[0] === "string" || typeof x[0] === "number"
@@ -1049,7 +1422,6 @@ function parseTransferFunctionControlPoints(
       );
     }
     const inputValue = parseDataTypeValue(dataType, x[0]);
-
     if (x[1].length !== 7 || x[1][0] !== "#") {
       throw new Error(
         `Expected #RRGGBB, but received: ${JSON.stringify(x[1])}`,
@@ -1130,8 +1502,6 @@ export class TrackableTransferFunctionParameters extends TrackableValue<Transfer
     public dataType: DataType,
     public defaultValue: TransferFunctionParameters,
   ) {
-    // Create a copy of the default value to enable detecting changes
-    // to the control points in the trackable value.
     const defaultValueCopy = copyTransferFunctionParameters(defaultValue);
     super(defaultValueCopy, (obj) =>
       parseTransferFunctionParameters(obj, dataType, defaultValueCopy),
@@ -1146,36 +1516,37 @@ export class TrackableTransferFunctionParameters extends TrackableValue<Transfer
       return inputValue;
     }
 
-    return controlPoints.map((x) => [
-      inputToJson(x.inputValue),
-      serializeColor(
-        vec3.fromValues(
-          x.outputColor[0] / 255,
-          x.outputColor[1] / 255,
-          x.outputColor[2] / 255,
-        ),
-      ),
-      x.outputColor[3] / 255,
+    function colorToJson(color: vec4) {
+      return `#${[0, 1, 2]
+        .map((i) => color[i].toString(16).padStart(2, "0"))
+        .join("")}`;
+    }
+
+    return controlPoints.map((controlPoint) => [
+      inputToJson(controlPoint.inputValue),
+      colorToJson(controlPoint.outputColor),
+      controlPoint.outputColor[3] / 255,
     ]);
   }
 
   toJSON() {
     const {
-      value: { channel, sortedControlPoints, defaultColor, window },
       dataType,
+      value: { sortedControlPoints, channel, defaultColor, window },
       defaultValue,
     } = this;
+    const channelJson = arraysEqual(defaultValue.channel, channel)
+      ? undefined
+      : channel;
+    const defaultColorJson =
+      serializeColor(defaultColor) === serializeColor(defaultValue.defaultColor)
+        ? undefined
+        : serializeColor(defaultColor);
     const windowJson = dataTypeIntervalToJson(
       window,
       dataType,
       defaultValue.window,
     );
-    const channelJson = arraysEqual(defaultValue.channel, channel)
-      ? undefined
-      : channel;
-    const colorJson = arraysEqual(defaultValue.defaultColor, defaultColor)
-      ? undefined
-      : serializeColor(defaultColor);
     const controlPointsJson = arraysEqualWithPredicate(
       defaultValue.sortedControlPoints.controlPoints,
       sortedControlPoints.controlPoints,
@@ -1187,17 +1558,17 @@ export class TrackableTransferFunctionParameters extends TrackableValue<Transfer
       : this.controlPointsToJson(sortedControlPoints.controlPoints, dataType);
     if (
       channelJson === undefined &&
-      colorJson === undefined &&
-      controlPointsJson === undefined &&
-      windowJson === undefined
+      defaultColorJson === undefined &&
+      windowJson === undefined &&
+      controlPointsJson === undefined
     ) {
       return undefined;
     }
     return {
       channel: channelJson,
-      defaultColor: colorJson,
-      controlPoints: controlPointsJson,
+      defaultColor: defaultColorJson,
       window: windowJson,
+      controlPoints: controlPointsJson,
     };
   }
 }
@@ -1259,6 +1630,25 @@ function getControlTrackable(control: ShaderUiControl): {
         trackable: new TrackableBoolean(control.default),
         getBuilderValue: (value) => ({ value }),
       };
+    case "select": {
+      const { options, valueType } = control;
+      const optionValues = options.map((option) => option.value);
+      return {
+        trackable: new TrackableValue<ShaderSelectValue>(
+          control.default,
+          (x) => {
+            const value = verifyShaderSelectValue(valueType, x);
+            if (!optionValues.includes(value)) {
+              throw new Error(
+                `${JSON.stringify(value)} is not one of the valid options ${JSON.stringify(optionValues)}`,
+              );
+            }
+            return value;
+          },
+        ),
+        getBuilderValue: () => null,
+      };
+    }
     case "transferFunction":
       return {
         trackable: new TrackableTransferFunctionParameters(
@@ -1269,6 +1659,14 @@ function getControlTrackable(control: ShaderUiControl): {
           channel: value.channel,
           dataType: control.dataType,
         }),
+      };
+    case "colormap":
+      return {
+        trackable: new TrackableColormapParameters(control.default),
+        // The colormap name is bound at draw time via a texture upload, so
+        // it intentionally does NOT participate in the shader build key.
+        // Switching colormaps rebinds the texture without recompiling.
+        getBuilderValue: () => null,
       };
   }
 }
@@ -1324,6 +1722,10 @@ export class ShaderControlState
   parseResult: WatchableValueInterface<ShaderControlsParseResult>;
   builderState: WatchableValueInterface<ShaderControlsBuilderState>;
   histogramSpecifications: HistogramSpecifications;
+  // Set of #uicontrol names that survived GLSL link-time dead-code elimination
+  // for the most recently rendered shader. `undefined` means "not yet known"
+  // (no shader has linked yet); UI treats that as "show everything".
+  activeControls = new WatchableValue<Set<string> | undefined>(undefined);
 
   private fragmentMainGeneration = -1;
   private dataContextGeneration = -1;
@@ -1332,6 +1734,7 @@ export class ShaderControlState
   private parseResult_: ShaderControlsParseResult;
   private controlsGeneration = -1;
   private parseResultChanged = new NullarySignal();
+  private lastReportedProgram: WebGLProgram | undefined = undefined;
 
   constructor(
     public fragmentMain: WatchableValueInterface<string>,
@@ -1350,6 +1753,9 @@ export class ShaderControlState
     this.registerDisposer(
       this.dataContext.changed.add(() => this.handleFragmentMainChanged()),
     );
+    // When a new colormap LUT finishes loading, propagate so render layers
+    // can retry their draws (skipped-due-to-not-ready frames recover here).
+    this.registerDisposer(colormapDataLoaded.add(this.changed.dispatch));
     this.handleFragmentMainChanged();
     const self = this;
     this.parseErrors = {
@@ -1466,6 +1872,7 @@ export class ShaderControlState
         source: "",
         code: "",
         controls: new Map(),
+        preprocessing: { stringLiteralIds: new Map() },
         errors: [{ line: 0, message: "Loading" }],
       };
       this.parseErrors_ = [];
@@ -1482,7 +1889,25 @@ export class ShaderControlState
         this.controls.value = result.controls;
       }
     }
+    // The active-controls set was derived from the previous shader. Forget the
+    // last reported program so `reportLinkedShader` recomputes it on the next
+    // link, rather than clearing `activeControls` here: linking happens fast
+    // enough that clearing would just flicker the controls in and back out.
+    this.lastReportedProgram = undefined;
     this.parseResultChanged.dispatch();
+  }
+
+  // Called by `setControlsInShader` once per linked shader program. Reads
+  // which uniforms survived link-time dead-code elimination and publishes the
+  // resulting set on `activeControls`. Idempotent for repeated calls with the
+  // same program.
+  reportLinkedShader(shader: ShaderProgram) {
+    if (shader.program === this.lastReportedProgram) return;
+    this.lastReportedProgram = shader.program;
+    const next = computeActiveControls(shader, this.parseResult_);
+    if (!activeControlsEqual(this.activeControls.value, next)) {
+      this.activeControls.value = next;
+    }
   }
 
   private handleControlsChanged() {
@@ -1610,17 +2035,26 @@ export class ShaderControlState
   }
 }
 
+/**
+ * Returns `true` if the control is ready to render with. Non-colormap
+ * controls are always ready (their values are computed synchronously).
+ * Colormap controls return `false` when the requested colormap's LUT
+ * has not yet been fetched AND no fallback colormap is uploaded — the
+ * caller should skip drawing this frame and wait for the next redraw
+ * triggered by `colormapDataLoaded`.
+ */
 function setControlInShader(
   gl: GL,
   shader: ShaderProgram,
   name: string,
   control: ShaderUiControl,
   value: any,
-) {
+  stringLiteralIds?: ReadonlyMap<string, number>,
+): boolean {
   const uName = uniformName(name);
-  const uniform = shader.uniform(uName);
   switch (control.type) {
-    case "slider":
+    case "slider": {
+      const uniform = shader.uniform(uName);
       switch (control.valueType) {
         case "int":
         case "uint":
@@ -1628,14 +2062,16 @@ function setControlInShader(
           break;
         case "float":
           gl.uniform1f(uniform, value);
+          break;
       }
-      break;
+      return true;
+    }
     case "color":
-      gl.uniform3fv(uniform, value);
-      break;
+      gl.uniform3fv(shader.uniform(uName), value);
+      return true;
     case "imageInvlerp":
       enableLerpShaderFunction(shader, uName, control.dataType, value.range);
-      break;
+      return true;
     case "propertyInvlerp": {
       const { dataType } = value as PropertyInvlerpParameters;
       enableLerpShaderFunction(
@@ -1644,11 +2080,29 @@ function setControlInShader(
         dataType,
         value.range ?? defaultDataTypeRange[dataType],
       );
-      break;
+      return true;
     }
     case "checkbox":
       // Value is hard-coded in shader.
-      break;
+      return true;
+    case "select": {
+      const uniform = shader.uniform(uName);
+      switch (control.valueType) {
+        case "string_t":
+          gl.uniform1ui(uniform, stringLiteralIds?.get(value as string) ?? 0);
+          break;
+        case "int":
+          gl.uniform1i(uniform, value);
+          break;
+        case "uint":
+          gl.uniform1ui(uniform, value);
+          break;
+        case "float":
+          gl.uniform1f(uniform, value);
+          break;
+      }
+      return true;
+    }
     case "transferFunction":
       enableTransferFunctionShader(
         shader,
@@ -1656,26 +2110,57 @@ function setControlInShader(
         control.dataType,
         value.sortedControlPoints,
       );
+      return true;
+    case "colormap": {
+      // Bind the texture holding this control's LUT. If the requested
+      // colormap isn't cached yet, `bindAndUpdateColormapTexture` kicks
+      // off a fetch and returns `ready: false` only when there's no
+      // previously-uploaded fallback. The caller skips the draw on the
+      // first frame; the next frame retries via `colormapDataLoaded`.
+      return shader.bindAndUpdateColormapTexture(name, value.colormap).ready;
+    }
   }
+  return false;
 }
 
+/**
+ * Sets all uniforms / textures for the given shader. Returns `true` if
+ * the shader is fully ready to render — `false` if at least one colormap
+ * control is waiting for its LUT to arrive with no fallback available.
+ * Callers should skip the draw when the return value is `false`; the
+ * `colormapDataLoaded` signal (wired into `ShaderControlState.changed`)
+ * triggers a redraw on each completed colormap fetch so the layer
+ * naturally retries.
+ */
 export function setControlsInShader(
   gl: GL,
   shader: ShaderProgram,
   shaderControlState: ShaderControlState,
-  controls: Controls,
-) {
+  parseResult: ShaderControlsParseResult,
+): boolean {
+  // Each renderer calls this once per draw, so it's the natural place to
+  // record which controls survived link-time DCE for the current shader.
+  // The call is idempotent for the same program — no GL roundtrip beyond
+  // the initial computation.
+  shaderControlState.reportLinkedShader(shader);
+  const {
+    controls,
+    preprocessing: { stringLiteralIds },
+  } = parseResult;
+  let ready = true;
   const { state } = shaderControlState;
   if (shaderControlState.controls.value === controls) {
     // Case when shader doesn't have any errors.
     for (const [name, controlState] of state) {
-      setControlInShader(
-        gl,
-        shader,
-        name,
-        controlState.control,
-        controlState.trackable.value,
-      );
+      ready =
+        setControlInShader(
+          gl,
+          shader,
+          name,
+          controlState.control,
+          controlState.trackable.value,
+          stringLiteralIds,
+        ) && ready;
     }
   } else {
     // Case when shader does have errors and we are using the fallback shader, which may have a
@@ -1687,7 +2172,26 @@ export function setControlsInShader(
         JSON.stringify(controlState.control) === JSON.stringify(control)
           ? controlState.trackable.value
           : control.default;
-      setControlInShader(gl, shader, name, control, value);
+      ready =
+        setControlInShader(
+          gl,
+          shader,
+          name,
+          control,
+          value,
+          stringLiteralIds,
+        ) && ready;
     }
   }
+  // Bind back-compat colormap textures (one per `colormapJet`/etc. usage).
+  // The list was recorded on the shader by addControlsToBuilder via an
+  // initializer, so the sampler symbols line up with what was emitted.
+  for (const { funcName, name } of shader.compatColormaps) {
+    ready =
+      shader.bindAndUpdateColormapTexture(
+        compatColormapSamplerSymbol(funcName),
+        name,
+      ).ready && ready;
+  }
+  return ready;
 }

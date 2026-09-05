@@ -22,13 +22,13 @@ import type { TrackableAlphaValue } from "#src/trackable_alpha.js";
 import type { TrackableBlendModeValue } from "#src/trackable_blend.js";
 import { BLEND_FUNCTIONS, BLEND_MODES } from "#src/trackable_blend.js";
 import { WatchableValue } from "#src/trackable_value.js";
-import { glsl_COLORMAPS } from "#src/webgl/colormaps.js";
 import type { WatchableShaderError } from "#src/webgl/dynamic_shader.js";
 import {
   makeTrackableFragmentMain,
   shaderCodeWithLineDirective,
 } from "#src/webgl/dynamic_shader.js";
 import type { ShaderBuilder, ShaderProgram } from "#src/webgl/shader.js";
+import { glsl_string } from "#src/webgl/shader_lib.js";
 import type {
   ShaderControlsBuilderState,
   ShaderControlState,
@@ -79,8 +79,8 @@ void emitTransparent() {
 void emitIntensity(float value) {
 }
 `);
-  builder.addFragmentCode(glsl_COLORMAPS);
   addControlsToBuilder(shaderBuilderState, builder);
+  builder.addFragmentCode(glsl_string);
   builder.setFragmentMainFunction(
     shaderCodeWithLineDirective(shaderBuilderState.parseResult.code),
   );
@@ -143,7 +143,7 @@ export class ImageRenderLayer extends SliceViewVolumeRenderLayer<ShaderControlsB
       gl,
       shader,
       this.shaderControlState,
-      parameters.parseResult.controls,
+      parameters.parseResult,
     );
   }
 

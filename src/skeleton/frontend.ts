@@ -41,6 +41,7 @@ import { SKELETON_LAYER_RPC_ID } from "#src/skeleton/base.js";
 import type { SliceViewPanel } from "#src/sliceview/panel.js";
 import type { SliceViewPanelRenderContext } from "#src/sliceview/renderlayer.js";
 import { SliceViewPanelRenderLayer } from "#src/sliceview/renderlayer.js";
+import { TrackableBoolean } from "#src/trackable_boolean.js";
 import { TrackableValue, WatchableValue } from "#src/trackable_value.js";
 import { DataType } from "#src/util/data_type.js";
 import { RefCounted } from "#src/util/disposable.js";
@@ -57,7 +58,6 @@ import {
   drawCircles,
   initializeCircleShader,
 } from "#src/webgl/circles.js";
-import { glsl_COLORMAPS } from "#src/webgl/colormaps.js";
 import type { GL } from "#src/webgl/context.js";
 import type { WatchableShaderError } from "#src/webgl/dynamic_shader.js";
 import {
@@ -75,6 +75,7 @@ import type {
   ShaderProgram,
   ShaderSamplerType,
 } from "#src/webgl/shader.js";
+import { glsl_string } from "#src/webgl/shader_lib.js";
 import type { ShaderControlsBuilderState } from "#src/webgl/shader_ui_controls.js";
 import {
   addControlsToBuilder,
@@ -186,7 +187,6 @@ void emitDefault() {
   emit(vec4(uColor.rgb, uColor.a * getLineAlpha() * ${this.getCrossSectionFadeFactor()}), uPickID);
 }
 `);
-          builder.addFragmentCode(glsl_COLORMAPS);
           const { vertexAttributes } = this;
           const numAttributes = vertexAttributes.length;
           for (let i = 1; i < numAttributes; ++i) {
@@ -200,6 +200,7 @@ void emitDefault() {
           }
           builder.setVertexMain(vertexMain);
           addControlsToBuilder(shaderBuilderState, builder);
+          builder.addFragmentCode(glsl_string);
           builder.setFragmentMainFunction(
             shaderCodeWithLineDirective(shaderBuilderState.parseResult.code),
           );
@@ -255,7 +256,6 @@ void emitDefault() {
   emitRGBA(uColor);
 }
 `);
-          builder.addFragmentCode(glsl_COLORMAPS);
           const { vertexAttributes } = this;
           const numAttributes = vertexAttributes.length;
           for (let i = 1; i < numAttributes; ++i) {
@@ -269,6 +269,7 @@ void emitDefault() {
           }
           builder.setVertexMain(vertexMain);
           addControlsToBuilder(shaderBuilderState, builder);
+          builder.addFragmentCode(glsl_string);
           builder.setFragmentMainFunction(
             shaderCodeWithLineDirective(shaderBuilderState.parseResult.code),
           );
@@ -378,7 +379,7 @@ void emitDefault() {
       initializeCircleShader(nodeShader, projectionParameters, {
         featherWidthInPixels: this.targetIsSliceView ? 1.0 : 0.0,
       });
-      drawCircles(nodeShader.gl, 2, skeletonChunk.numVertices);
+      drawCircles(nodeShader.gl, 1, skeletonChunk.numVertices);
     }
   }
 
@@ -429,6 +430,7 @@ export class SkeletonRenderingOptions implements Trackable {
 
   shader = makeTrackableFragmentMain(DEFAULT_FRAGMENT_MAIN);
   shaderControlState = new ShaderControlState(this.shader);
+  hideInactiveShaderControls = new TrackableBoolean(false);
   params2d: ViewSpecificSkeletonRenderingOptions = {
     mode: new TrackableSkeletonRenderMode(SkeletonRenderMode.LINES_AND_POINTS),
     lineWidth: new TrackableSkeletonLineWidth(2),
@@ -442,6 +444,7 @@ export class SkeletonRenderingOptions implements Trackable {
     const { compound } = this;
     compound.add("shader", this.shader);
     compound.add("shaderControls", this.shaderControlState);
+    compound.add("hideInactiveShaderControls", this.hideInactiveShaderControls);
     compound.add("mode2d", this.params2d.mode);
     compound.add("lineWidth2d", this.params2d.lineWidth);
     compound.add("mode3d", this.params3d.mode);
@@ -584,7 +587,7 @@ export class SkeletonLayer extends RefCounted {
       gl,
       edgeShader,
       shaderControlState,
-      edgeShaderParameters.parseResult.controls,
+      edgeShaderParameters.parseResult,
     );
     gl.uniform1f(edgeShader.uniform("uLineWidth"), lineWidth!);
 
@@ -595,7 +598,7 @@ export class SkeletonLayer extends RefCounted {
       gl,
       nodeShader,
       shaderControlState,
-      nodeShaderParameters.parseResult.controls,
+      nodeShaderParameters.parseResult,
     );
 
     const skeletons = source.chunks;

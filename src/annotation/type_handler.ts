@@ -32,7 +32,6 @@ import type { WatchableValueInterface } from "#src/trackable_value.js";
 import { RefCounted } from "#src/util/disposable.js";
 import type { mat4 } from "#src/util/geom.js";
 import type { GLBuffer } from "#src/webgl/buffer.js";
-import { glsl_COLORMAPS } from "#src/webgl/colormaps.js";
 import type { GL } from "#src/webgl/context.js";
 import type {
   ParameterizedContextDependentShaderGetter,
@@ -48,6 +47,7 @@ import {
 } from "#src/webgl/lerp.js";
 import type { ShaderModule, ShaderProgram } from "#src/webgl/shader.js";
 import { ShaderBuilder } from "#src/webgl/shader.js";
+import { glsl_string } from "#src/webgl/shader_lib.js";
 import type {
   ShaderControlsBuilderState,
   ShaderControlState,
@@ -381,8 +381,6 @@ export abstract class AnnotationRenderHelper extends AnnotationRenderHelperBase 
         builder.addUniform("highp uint", "uPickID");
         builder.addVarying("highp uint", "vPickID", "flat");
 
-        builder.addVertexCode(glsl_COLORMAPS);
-
         builder.addVertexCode(`
 vec3 defaultColor() { return uColor; }
 highp uint getPickBaseOffset() { return uint(gl_InstanceID) * ${this.pickIdsPerInstance}u; }
@@ -558,6 +556,7 @@ void userMain();
           renderHandler.defineShaderNoOpSetters(builder);
         }
         defineShader(builder);
+        builder.addVertexCode(glsl_string);
         builder.addVertexCode(
           "\n#define main userMain\n" +
             shaderCodeWithLineDirective(parameters.parseResult.code) +
@@ -634,7 +633,7 @@ if (ng_discardValue) {
       gl,
       shader,
       this.shaderControlState,
-      parameters.parseResult.controls,
+      parameters.parseResult,
     );
     gl.uniform3fv(shader.uniform("uSubspaceMatrix"), context.subspaceMatrix);
     gl.uniform1fv(shader.uniform("uModelClipBounds"), context.modelClipBounds);

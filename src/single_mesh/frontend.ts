@@ -56,7 +56,6 @@ import { vec3 } from "#src/util/geom.js";
 import type { ProgressOptions } from "#src/util/progress_listener.js";
 import { withSharedVisibility } from "#src/visibility_priority/frontend.js";
 import type { GLBuffer } from "#src/webgl/buffer.js";
-import { glsl_COLORMAPS } from "#src/webgl/colormaps.js";
 import type { GL } from "#src/webgl/context.js";
 import {
   makeTrackableFragmentMain,
@@ -78,7 +77,7 @@ import type {
   ShaderProgram,
   ShaderSamplerType,
 } from "#src/webgl/shader.js";
-import { getShaderType } from "#src/webgl/shader_lib.js";
+import { getShaderType, glsl_string } from "#src/webgl/shader_lib.js";
 import type { ShaderControlsBuilderState } from "#src/webgl/shader_ui_controls.js";
 import {
   addControlsToBuilder,
@@ -259,7 +258,6 @@ void emitGray() {
   emitRGB(vec3(1.0, 1.0, 1.0));
 }
 `);
-    builder.addFragmentCode(glsl_COLORMAPS);
 
     // Make sure defineAttributeAccess is the last thing that adds fragment code prior to
     // this.fragmentMain, so that the #define attributes don't mess anything up.
@@ -504,6 +502,7 @@ export class SingleMeshLayer extends PerspectiveViewRenderLayer<ThreeDimensional
           }
           addControlsToBuilder(shaderBuilderState, builder);
           this.shaderManager.defineShader(builder);
+          builder.addFragmentCode(glsl_string);
           builder.setFragmentMainFunction(
             shaderCodeWithLineDirective(shaderBuilderState.parseResult.code),
           );
@@ -604,7 +603,7 @@ export class SingleMeshLayer extends PerspectiveViewRenderLayer<ThreeDimensional
       gl,
       shader,
       this.displayState.shaderControlState,
-      parameters.parseResult.controls,
+      parameters.parseResult,
     );
 
     const { pickIDs } = renderContext;
