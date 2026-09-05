@@ -1114,8 +1114,12 @@ float ${uName}() {
         // re-uploads the texture rather than recompiling the shader.
         const samplerName = `${uName}_sampler`;
         builder.addTextureSampler("sampler2D", samplerName, name);
-        const wrapper = `vec3 ${uName}(float t) { return texture(${samplerName}, vec2(clamp(t, 0.0, 1.0), 0.5)).rgb; }\n`;
-        const define = `#define ${name} ${uName}\n`;
+        const rgbaName = `${uName}RGBA`;
+        const wrapper = [
+          `vec3 ${uName}(float t) { return texture(${samplerName}, vec2(clamp(t, 0.0, 1.0), 0.5)).rgb; }\n`,
+          `vec4 ${rgbaName}(float t) { return vec4(${uName}(t), t); }\n`,
+        ].join("");
+        const define = `#define ${name} ${uName}\n#define ${name}RGBA ${rgbaName}\n`;
         builder.addFragmentCode(wrapper);
         builder.addFragmentCode(define);
         builder.addVertexCode(wrapper);
